@@ -1,0 +1,498 @@
+syntax = "proto2";
+
+package test;
+
+import "google/protobuf/any.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/empty.proto";
+import "google/protobuf/struct.proto";
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/wrappers.proto";
+
+option go_package = ".;main";
+
+// A service that allows testing all kinds of permutations of message
+// and field types in the grpcui web form.
+
+service KitchenSink {
+
+    // Ping is a no-op method, usable to test that a given channel works. No data is exchanged.
+    rpc Ping (google.protobuf.Empty) returns (google.protobuf.Empty);
+
+    // The Exchange method can be useful for testing the UI. It's complicated request type
+    // exercises many of the feature in gRPC UI's request form building code. The server will
+    // echo back in response metadata all request metadata values it receives. If the metadata
+    // key ends with "-t", it is sent back as trailer metadata. Otherwise, it is sent back as
+    // header metadata. The response will be the same as the request.
+    rpc Exchange (TestMessage) returns (TestMessage);
+
+    // The UploadMany method is like Exchange, except that it is for testing RPCs that accept
+    // a stream from the client. The server will reply with the last request message it
+    // received, but with the needed_num_a field set to the number of messages observed. If
+    // the client stream includes zero messages, the server will reply with an "Invalid
+    // Argument" error code.
+    rpc UploadMany (stream TestMessage) returns (TestMessage);
+
+    // The DownloadMany method is like Exchange, except that it is for testing RPCs that have
+    // a stream from the server. The value in the request for the numbers.needed_num_1 field
+    // controls how many messages are included in the response stream. Each response sent is
+    // a copy of the request.
+    rpc DownloadMany (TestMessage) returns (stream TestMessage);
+
+    // The DoManyThings method is like Exchange, except that it is for testing RPCs that
+    // have bidirectional streams. The response stream will be a copy of the request
+    // stream, so each request is mirrored to the response stream as it is received.
+    rpc DoManyThings (stream TestMessage) returns (stream TestMessage);
+
+    // Fail is useful for testing errors. The num_responses request field controls how many
+    // response messages are sent before returning an error. The other request fields are
+    // used to construct the error that will be returned.
+    rpc Fail (FailRequest) returns (stream TestMessage);
+
+    // SendTimestamp is for testing the UI web form, that it can construct a request
+    // form that has only the single scalar input for a timestamp.
+    rpc SendTimestamp(google.protobuf.Timestamp) returns (google.protobuf.Empty);
+    // SendDuration is for testing the UI web form, that it can construct a request
+    // form that has only the single scalar input for a duration.
+    rpc SendDuration(google.protobuf.Duration) returns (google.protobuf.Empty);
+    // SendAny is for testing the UI web form, that it can construct a request
+    // form that has only the single Any message input.
+    rpc SendAny(google.protobuf.Any) returns (google.protobuf.Empty);
+    // SendStruct is for testing the UI web form, that it can construct a request
+    // form that has only the single, text area input for a JSON object.
+    rpc SendStruct(google.protobuf.Struct) returns (google.protobuf.Empty);
+    // SendValue is for testing the UI web form, that it can construct a request
+    // form that has only the single, text area input for a JSON value.
+    rpc SendValue(google.protobuf.Value) returns (google.protobuf.Empty);
+    // SendListValue is for testing the UI web form, that it can construct a request
+    // form that has just the input(s) for a JSON array.
+    rpc SendListValue(google.protobuf.ListValue) returns (google.protobuf.Empty);
+    // SendBytes is for testing the UI web form, that it can construct a request
+    // form that has only the single scalar input for a bytes value.
+    rpc SendBytes(google.protobuf.BytesValue) returns (google.protobuf.Empty);
+    // SendString is for testing the UI web form, that it can construct a request
+    // form that has only the single scalar input for a string value.
+    rpc SendString(google.protobuf.StringValue) returns (google.protobuf.Empty);
+    // SendBool is for testing the UI web form, that it can construct a request
+    // form that has only the single scalar input for a boolean value.
+    rpc SendBool(google.protobuf.BoolValue) returns (google.protobuf.Empty);
+    // SendDouble is for testing the UI web form, that it can construct a request
+    // form that has only the single scalar input for a double value.
+    rpc SendDouble(google.protobuf.DoubleValue) returns (google.protobuf.Empty);
+    // SendFloat is for testing the UI web form, that it can construct a request
+    // form that has only the single scalar input for a float value.
+    rpc SendFloat(google.protobuf.FloatValue) returns (google.protobuf.Empty);
+    // SendInt32 is for testing the UI web form, that it can construct a request
+    // form that has only the single scalar input for a signed 32-bit int value.
+    rpc SendInt32(google.protobuf.Int32Value) returns (google.protobuf.Empty);
+    // SendInt64 is for testing the UI web form, that it can construct a request
+    // form that has only the single scalar input for a signed 64-bit int value.
+    rpc SendInt64(google.protobuf.Int64Value) returns (google.protobuf.Empty);
+    // SendUInt32 is for testing the UI web form, that it can construct a request
+    // form that has only the single scalar input for an unsigned 32-bit int value.
+    rpc SendUInt32(google.protobuf.UInt32Value) returns (google.protobuf.Empty);
+    // SendUInt64 is for testing the UI web form, that it can construct a request
+    // form that has only the single scalar input for an unsigned 64-bit int value.
+    rpc SendUInt64(google.protobuf.UInt64Value) returns (google.protobuf.Empty);
+
+    // These are the same as the ones above, but for testing all of the same combinations
+    // as request streams instead of singular inputs.
+
+    rpc SendMultipleTimestamp(stream google.protobuf.Timestamp) returns (google.protobuf.Empty);
+    rpc SendMultipleDuration(stream google.protobuf.Duration) returns (google.protobuf.Empty);
+    rpc SendMultipleAny(stream google.protobuf.Any) returns (google.protobuf.Empty);
+    rpc SendMultipleStruct(stream google.protobuf.Struct) returns (google.protobuf.Empty);
+    rpc SendMultipleValue(stream google.protobuf.Value) returns (google.protobuf.Empty);
+    rpc SendMultipleListValue(stream google.protobuf.ListValue) returns (google.protobuf.Empty);
+    rpc SendMultipleBytes(stream google.protobuf.BytesValue) returns (google.protobuf.Empty);
+    rpc SendMultipleString(stream google.protobuf.StringValue) returns (google.protobuf.Empty);
+    rpc SendMultipleBool(stream google.protobuf.BoolValue) returns (google.protobuf.Empty);
+    rpc SendMultipleDouble(stream google.protobuf.DoubleValue) returns (google.protobuf.Empty);
+    rpc SendMultipleFloat(stream google.protobuf.FloatValue) returns (google.protobuf.Empty);
+    rpc SendMultipleInt32(stream google.protobuf.Int32Value) returns (google.protobuf.Empty);
+    rpc SendMultipleInt64(stream google.protobuf.Int64Value) returns (google.protobuf.Empty);
+    rpc SendMultipleUInt32(stream google.protobuf.UInt32Value) returns (google.protobuf.Empty);
+    rpc SendMultipleUInt64(stream google.protobuf.UInt64Value) returns (google.protobuf.Empty);
+}
+
+enum State {
+    INVALID = 0;
+    INITIAL = 1;
+    PENDING = 2;
+    RUNNING = 3;
+    PAUSED = 4;
+    AWAITING_INPUT = 5;
+    CANCELLING = 6;
+    COMPLETE = 7;
+    CANCELLED = 8;
+    FAILED = 9;
+}
+
+enum Void {
+    VOID = 0;
+}
+
+message Person {
+    // The unique ID of the person
+    required uint64 id = 1;
+    // The person's full name
+    required string name = 2;
+    // The person's address
+    optional Address address = 3;
+    optional double xyz = 4 [default = 3.14159];
+    optional string title = 5 [default = "overseer"];
+    repeated string labels = 6;
+    optional bool is_real = 7 [default = true];
+    optional bytes opaque = 8 [default = "\01\02\03\04"];
+
+    oneof relative {
+        Person parent = 9;
+        Person sibling = 10;
+        Person child = 11;
+        Void none = 12;
+    }
+}
+
+message Address {
+    required string line1 = 1;
+    optional string line2 = 2;
+    required string city = 3;
+    required string state = 4;
+    required uint32 zip = 5;
+}
+
+message WellKnowns {
+    required google.protobuf.Timestamp now = 1;
+    optional google.protobuf.Timestamp past = 2;
+    repeated google.protobuf.Timestamp futures = 3;
+
+    required google.protobuf.Duration period = 4;
+    optional google.protobuf.Duration next_interval = 5;
+    repeated google.protobuf.Duration history_intervals = 6;
+
+    required google.protobuf.Any neat = 7;
+    optional google.protobuf.Any extra = 8;
+    repeated google.protobuf.Any extensions = 9;
+
+    required google.protobuf.Struct object = 10;
+    optional google.protobuf.Struct optional_object = 11;
+    repeated google.protobuf.Struct objects = 12;
+
+    required google.protobuf.Value value = 13;
+    optional google.protobuf.Value optional_value = 14;
+    repeated google.protobuf.Value values = 15;
+
+    required google.protobuf.ListValue list = 16;
+    optional google.protobuf.ListValue optional_list = 17;
+    repeated google.protobuf.ListValue lists = 18;
+
+    required google.protobuf.BytesValue bytes = 19;
+    optional google.protobuf.BytesValue optional_bytes = 20;
+    repeated google.protobuf.BytesValue list_o_bytes = 21;
+
+    required google.protobuf.StringValue string = 22;
+    optional google.protobuf.StringValue optional_string = 23;
+    repeated google.protobuf.StringValue list_o_strings = 24;
+
+    required google.protobuf.BoolValue bool = 25;
+    optional google.protobuf.BoolValue optional_bool = 26;
+    repeated google.protobuf.BoolValue list_o_bools = 27;
+
+    required google.protobuf.DoubleValue double = 28;
+    optional google.protobuf.DoubleValue optional_double = 29;
+    repeated google.protobuf.DoubleValue list_o_doubles = 30;
+
+    required google.protobuf.FloatValue float = 31;
+    optional google.protobuf.FloatValue optional_float = 32;
+    repeated google.protobuf.FloatValue list_o_floats = 33;
+
+    required google.protobuf.Int32Value small_int = 34;
+    optional google.protobuf.Int32Value optional_small_int = 35;
+    repeated google.protobuf.Int32Value list_o_small_ints = 36;
+
+    required google.protobuf.Int64Value big_int = 37;
+    optional google.protobuf.Int64Value optional_big_int = 38;
+    repeated google.protobuf.Int64Value list_o_big_ints = 39;
+
+    required google.protobuf.UInt32Value small_id = 40;
+    optional google.protobuf.UInt32Value optional_small_id = 41;
+    repeated google.protobuf.UInt32Value list_o_small_ids = 42;
+
+    required google.protobuf.UInt64Value big_id = 43;
+    optional google.protobuf.UInt64Value optional_big_id = 44;
+    repeated google.protobuf.UInt64Value list_o_big_ids = 45;
+}
+
+message NumbersNumbersNumbers {
+    optional int32 usually_1 = 1 [default = 1];
+    optional int32 some_num_1 = 2;
+    required int32 needed_num_1 = 3;
+
+    optional int64 usually_2 = 4 [default = 2];
+    optional int64 some_num_2 = 5;
+    required int64 needed_num_2 = 6;
+
+    optional uint32 usually_3 = 7 [default = 3];
+    optional uint32 some_num_3 = 8;
+    required uint32 needed_num_3 = 9;
+
+    optional uint64 usually_4 = 10 [default = 4];
+    optional uint64 some_num_4 = 11;
+    required uint64 needed_num_4 = 12;
+
+    optional sint32 usually_5 = 13 [default = 5];
+    optional sint32 some_num_5 = 14;
+    required sint32 needed_num_5 = 15;
+
+    optional sint64 usually_6 = 16 [default = 6];
+    optional sint64 some_num_6 = 17;
+    required sint64 needed_num_6 = 18;
+
+    optional fixed32 usually_7 = 19 [default = 7];
+    optional fixed32 some_num_7 = 20;
+    required fixed32 needed_num_7 = 21;
+
+    optional fixed64 usually_8 = 22 [default = 8];
+    optional fixed64 some_num_8 = 23;
+    required fixed64 needed_num_8 = 24;
+
+    optional sfixed32 usually_9 = 25 [default = 9];
+    optional sfixed32 some_num_9 = 26;
+    required sfixed32 needed_num_9 = 27;
+
+    optional sfixed64 usually_10 = 28 [default = 10];
+    optional sfixed64 some_num_10 = 29;
+    required sfixed64 needed_num_10 = 30;
+}
+
+message Arrays {
+    repeated string names = 1;
+    repeated bytes data = 2;
+    repeated Person relatives = 3;
+    repeated State other_states = 14;
+}
+
+message Maps {
+    map<string, Void> string_set = 1;
+    map<int32, Void> int32_set = 2;
+    map<int64, Void> int64_set = 3;
+    map<uint32, Void> uint32_set = 4;
+    map<uint64, Void> uint64_set = 5;
+    map<sint32, Void> sint32_set = 6;
+    map<sint64, Void> sint64_set = 7;
+    map<fixed32, google.protobuf.Empty> fixed32_set = 8;
+    map<fixed64, google.protobuf.Empty> fixed64_set = 9;
+    map<sfixed32, google.protobuf.Empty> sfixed32_set = 10;
+    map<sfixed64, google.protobuf.Empty> sfixed64_set = 11;
+
+    map<int32, Person> people_by_employee_num = 12;
+    map<int32, State> states = 13;
+
+    map<string, string> string_names = 14;
+    map<string, bytes> bytes_names = 15;
+    map<string, bool> bool_names = 16;
+    map<string, double> double_names = 17;
+    map<string, float> float_names = 18;
+}
+
+message TestMessage {
+
+    // To recurse or not to recurse
+    optional TestMessage recurse = 2;
+
+    // It's even possible to do this repeatedly!
+    repeated TestMessage repeated_recurse = 3;
+
+    required Person person = 4;
+    required State state = 5;
+
+    optional NumbersNumbersNumbers numbers = 6;
+
+    optional float usually_4242 = 7 [default = 4242];
+    optional float some_num_a = 8;
+    required float needed_num_a = 9;
+
+    optional double usually_9999 = 10 [default = 9999];
+    optional double some_num_b = 11;
+    required double needed_num_b = 12;
+
+    optional State next_state = 13 [default = PENDING];
+
+    optional bytes base64_stuff = 14;
+    required bytes opaque_id = 15;
+
+    optional WellKnowns wk = 16;
+    optional Arrays arrays = 17;
+    optional Maps maps = 18;
+
+    optional group Misc = 19 {
+        optional string foo = 1;
+        optional int32 bar = 2;
+    }
+}
+
+// basically a copy of Code from google/rpc/code.proto
+enum RpcStatusCode {
+    // Not an error; returned on success
+    //
+    // HTTP Mapping: 200 OK
+    OK = 0;
+
+    // The operation was canceled, typically by the caller.
+    //
+    // HTTP Mapping: 499 Client Closed Request
+    CANCELED = 1;
+
+    // Unknown error.  For example, this error may be returned when
+    // a `Status` value received from another address space belongs to
+    // an error space that is not known in this address space.  Also
+    // errors raised by APIs that do not return enough error information
+    // may be converted to this error.
+    //
+    // HTTP Mapping: 500 Internal Server Error
+    UNKNOWN = 2;
+
+    // The client specified an invalid argument.  Note that this differs
+    // from `FAILED_PRECONDITION`.  `INVALID_ARGUMENT` indicates arguments
+    // that are problematic regardless of the state of the system
+    // (e.g., a malformed file name).
+    //
+    // HTTP Mapping: 400 Bad Request
+    INVALID_ARGUMENT = 3;
+
+    // The deadline expired before the operation could complete. For operations
+    // that change the state of the system, this error may be returned
+    // even if the operation has completed successfully.  For example, a
+    // successful response from a server could have been delayed long
+    // enough for the deadline to expire.
+    //
+    // HTTP Mapping: 504 Gateway Timeout
+    DEADLINE_EXCEEDED = 4;
+
+    // Some requested entity (e.g., file or directory) was not found.
+    //
+    // Note to server developers: if a request is denied for an entire class
+    // of users, such as gradual feature rollout or undocumented whitelist,
+    // `NOT_FOUND` may be used. If a request is denied for some users within
+    // a class of users, such as user-based access control, `PERMISSION_DENIED`
+    // must be used.
+    //
+    // HTTP Mapping: 404 Not Found
+    NOT_FOUND = 5;
+
+    // The entity that a client attempted to create (e.g., file or directory)
+    // already exists.
+    //
+    // HTTP Mapping: 409 Conflict
+    ALREADY_EXISTS = 6;
+
+    // The caller does not have permission to execute the specified
+    // operation. `PERMISSION_DENIED` must not be used for rejections
+    // caused by exhausting some resource (use `RESOURCE_EXHAUSTED`
+    // instead for those errors). `PERMISSION_DENIED` must not be
+    // used if the caller can not be identified (use `UNAUTHENTICATED`
+    // instead for those errors). This error code does not imply the
+    // request is valid or the requested entity exists or satisfies
+    // other pre-conditions.
+    //
+    // HTTP Mapping: 403 Forbidden
+    PERMISSION_DENIED = 7;
+
+    // The request does not have valid authentication credentials for the
+    // operation.
+    //
+    // HTTP Mapping: 401 Unauthorized
+    UNAUTHENTICATED = 16;
+
+    // Some resource has been exhausted, perhaps a per-user quota, or
+    // perhaps the entire file system is out of space.
+    //
+    // HTTP Mapping: 429 Too Many Requests
+    RESOURCE_EXHAUSTED = 8;
+
+    // The operation was rejected because the system is not in a state
+    // required for the operation's execution.  For example, the directory
+    // to be deleted is non-empty, an rmdir operation is applied to
+    // a non-directory, etc.
+    //
+    // Service implementors can use the following guidelines to decide
+    // between `FAILED_PRECONDITION`, `ABORTED`, and `UNAVAILABLE`:
+    //  (a) Use `UNAVAILABLE` if the client can retry just the failing call.
+    //  (b) Use `ABORTED` if the client should retry at a higher level
+    //      (e.g., when a client-specified test-and-set fails, indicating the
+    //      client should restart a read-modify-write sequence).
+    //  (c) Use `FAILED_PRECONDITION` if the client should not retry until
+    //      the system state has been explicitly fixed.  E.g., if an "rmdir"
+    //      fails because the directory is non-empty, `FAILED_PRECONDITION`
+    //      should be returned since the client should not retry unless
+    //      the files are deleted from the directory.
+    //
+    // HTTP Mapping: 400 Bad Request
+    FAILED_PRECONDITION = 9;
+
+    // The operation was aborted, typically due to a concurrency issue such as
+    // a sequencer check failure or transaction abort.
+    //
+    // See the guidelines above for deciding between `FAILED_PRECONDITION`,
+    // `ABORTED`, and `UNAVAILABLE`.
+    //
+    // HTTP Mapping: 409 Conflict
+    ABORTED = 10;
+
+    // The operation was attempted past the valid range.  E.g., seeking or
+    // reading past end-of-file.
+    //
+    // Unlike `INVALID_ARGUMENT`, this error indicates a problem that may
+    // be fixed if the system state changes. For example, a 32-bit file
+    // system will generate `INVALID_ARGUMENT` if asked to read at an
+    // offset that is not in the range [0,2^32-1], but it will generate
+    // `OUT_OF_RANGE` if asked to read from an offset past the current
+    // file size.
+    //
+    // There is a fair bit of overlap between `FAILED_PRECONDITION` and
+    // `OUT_OF_RANGE`.  We recommend using `OUT_OF_RANGE` (the more specific
+    // error) when it applies so that callers who are iterating through
+    // a space can easily look for an `OUT_OF_RANGE` error to detect when
+    // they are done.
+    //
+    // HTTP Mapping: 400 Bad Request
+    OUT_OF_RANGE = 11;
+
+    // The operation is not implemented or is not supported/enabled in this
+    // service.
+    //
+    // HTTP Mapping: 501 Not Implemented
+    UNIMPLEMENTED = 12;
+
+    // Internal errors.  This means that some invariants expected by the
+    // underlying system have been broken.  This error code is reserved
+    // for serious errors.
+    //
+    // HTTP Mapping: 500 Internal Server Error
+    INTERNAL = 13;
+
+    // The service is currently unavailable.  This is most likely a
+    // transient condition, which can be corrected by retrying with
+    // a backoff. Note that it is not always safe to retry
+    // non-idempotent operations.
+    //
+    // See the guidelines above for deciding between `FAILED_PRECONDITION`,
+    // `ABORTED`, and `UNAVAILABLE`.
+    //
+    // HTTP Mapping: 503 Service Unavailable
+    UNAVAILABLE = 14;
+
+    // Unrecoverable data loss or corruption.
+    //
+    // HTTP Mapping: 500 Internal Server Error
+    DATA_LOSS = 15;
+}
+
+message FailRequest {
+    optional int32 num_responses = 1;
+
+    // basically a copy of Status from google/rpc/status.proto
+    optional RpcStatusCode code = 2;
+    optional string message = 3;
+    repeated google.protobuf.Any details = 4;
+}
