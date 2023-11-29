@@ -2,35 +2,35 @@
 # -*- coding: utf-8 -*-
 
 
-import requests 
+ 
 import sys 
+import subprocess
 
-WL = "/usr/share/wordlists/PythonForPentesters/wordlist2.txt"
 
-sub_list = open(WL).read() 
-subdoms = sub_list.splitlines()
 
-for sub in subdoms:
-    sub_domains = f"http://{sub}.{sys.argv[1]}" 
+IP = sys.argv[1]
+WL = sys.argv[2]
+OutPuts = sys.argv[3]
 
-    try:
-        requests.get(sub_domains)
+
+dirdomains = f"sudo ffuf -u http://{IP}/FUZZ -w {WL}  -recursion -recursion-depth 3 -e html,php,index  -c  -o commondir2.txt"
+# Run the command and capture the output
+try:
+    result = subprocess.run(dirdomains, shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    output = result.stdout
+    error = result.stderr
+except subprocess.CalledProcessError as e:
+    output = e.output
+    error = e.stderr
+
+
+output_file_path = f"{OutPuts}/commondir2.txt"
+
+# Read the output from the file
+with open(output_file_path, "r") as file:
+    output = file.read()
+print(output)
     
-    except requests.ConnectionError: 
-        pass
-    
-    else:
-        print("Valid domain: ",sub_domains)
-        
-        
-sub_list = open(WL).read() 
-directories = sub_list.splitlines()
-        
-        
-for dir in directories:
-    dir_enum = f"http://{sys.argv[1]}/{dir}.html" 
-    r = requests.get(dir_enum)
-    if r.status_code==404: 
-        pass
-    else:
-        print("Valid directory:" ,dir_enum)
+
+
+
