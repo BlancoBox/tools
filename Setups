@@ -1,0 +1,2 @@
+sudo apt update && sudo apt install -y feroxbuster # dev by:epi052 
+docker run -it mcnamee/huntkit #docker of tools developed by: mcnamee
