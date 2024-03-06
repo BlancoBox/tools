@@ -23,13 +23,28 @@ directory = sys.argv[2]
 user = sys.argv[3]
 output_file = 'url.txt'
 
+
+#run commands
 def run_command(command):
     try:
         subprocess.run(command, shell=True, check=True)
     except subprocess.CalledProcessError as e:
         print(f"Error executing command: {e}")
 
+#removes top level domain like .com from traget
+def remove_tld(url):
+    # Define the regex pattern to match the TLD
+    tld_pattern = r'\.(com|net|org|edu|gov|mil|co\.uk|org\.uk|ac\.uk|de)$'
 
+    # Replace the TLD with an empty string
+    url_without_tld = re.sub(tld_pattern, '', url)
+
+    return url_without_tld
+
+IPPurre = remove_tld(IP)
+
+
+#read required api keys from host
 def read_api_key():
     try:
         with open("/home/blancobox/apikeys/github.txt", "r") as file:
@@ -39,6 +54,7 @@ def read_api_key():
         print("API key file not found.")
         return None
 
+#extract domain name from scans
 def extract_domains(root_domain, directory):
     # Compile regex pattern to match domain names
     domain_pattern = re.compile(r'(?:https?://)?(?:www\.)?([a-zA-Z0-9.-]+(?:\.[a-zA-Z]{2,})?)')
@@ -68,6 +84,8 @@ def write_to_file(domains, output_file):
     with open(output_file, 'w') as file:
         for domain in domains:
             file.write(domain + '\n')
+            
+#batch run scans using tools (amass, github-subdomains.py, gospider, jldc, chaos, assetfinder)                       
 def main():
     APYKEYGITHUB = read_api_key()
 
@@ -77,13 +95,19 @@ def main():
             f'sudo python3 /home/blancobox/tools/github-search/github-subdomains.py -t {APYKEYGITHUB} -d {IP} | sudo tee gitsearchFOE.txt',
             f'curl -s "https://jldc.me/anubis/subdomains/{IP}" | grep -Po "((http|https):\/\/)?(([\w.-]*)\.([\w]*)\.([A-z]))\w+" | anew | sudo tee jldcFoE.txt',
             f'chaos -d {IP} | tee chaos.txt',
-            f'assetfinder -subs-only {IP} -silent | grep "innogames" | sudo tee asstfin.txt',
+            f'assetfinder -subs-only {IP} -silent | grep "{IPPurre}" | sudo tee asstfin.txt',
             f"curl -s 'https://crt.sh/?q=%25.{IP}&output=json' | jq -r '.[].name_value' | assetfinder -subs-only | sed 's#$#/.git/HEAD#g' | anew | sudo tee bufferover.txt",
             f'mkdir {directory}/Amassed',
             f'amass enum -d {IP} | sudo tee amass.txt',
             f'sudo cp {directory}/amass.txt {directory}/Amassed',
             f'sudo chown -R {user}:{user} {directory}/*',
             f'cat {directory}/* >> url.txt'
+            
+            '''
+            # diffrent home made tools in my kit to add http:// and httpx it
+            f'sudo python3 ~/tools/PythonScripts/HTTPAdder.py url.txt | tee httpurl.txt',
+            f'sudo python3 ~/tools/PythonScripts/HTTPXlist.py  httpurl.txt | tee httpxurl.txt'
+            '''
     ]
         
 
