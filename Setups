@@ -1,2 +1,14 @@
 sudo apt update && sudo apt install -y feroxbuster # dev by:epi052 
-docker run -it mcnamee/huntkit #docker of tools developed by: mcnamee
+go install github.com/projectdiscovery/dnsx/cmd/dnsx@latest
+go install github.com/lc/gau@latest
+go install github.com/projectdiscovery/httpx/cmd/httpx@latest
+go install github.com/GerbenJavado/LinkFinder@latest
+go install github.com/tomnomnom/meg@latest
+go install github.com/opsdisk/pagodo@latest
+go install github.com/lc/subjs@latest
+go install github.com/s0md3v/XSStrike@latest
+go install github.com/haccer/breach-parse@latest
+go install github.com/ticarpi/jwt_tool@latest
+go install github.com/tomnomnom/unfurl@latest
+
+#docker run -it mcnamee/huntkit #docker of tools developed by: mcnamee
