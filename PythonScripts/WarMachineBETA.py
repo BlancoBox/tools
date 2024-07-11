@@ -7,7 +7,7 @@ import sys
 import re
 import json
 
-def run_command(command, timeout=600):
+def run_command(command, timeout=60000):
     try:
         result = subprocess.run(command, shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout)
         return result.stdout, result.stderr
@@ -31,23 +31,39 @@ def write_file(file_path, content):
     with open(file_path, "w") as file:
         file.write(content)
 
-def extract_ports_and_domain(output, patterns):
-    open_ports = set()
-    http_ports = set()
-    https_ports = set()
-    domain_name = None
-    for pattern, port_type in patterns:
-        matches = re.findall(pattern, output, re.IGNORECASE | re.DOTALL)
-        if port_type == 'http':
-            http_ports.update(matches)
-        elif port_type == 'https':
-            https_ports.update(matches)
-        elif port_type == 'domain':
-            if matches:
-                domain_name = matches[0]
-        else:
-            open_ports.update(matches)
-    return list(open_ports), list(http_ports), list(https_ports), domain_name
+def extract_details(output):
+    patterns = {
+        'open_ports': re.compile(r'(\d+)/tcp\s+open'),
+        'http_ports': re.compile(r'(\d+)/tcp\s+open\s+http'),
+        'https_ports': re.compile(r'(\d+)/tcp\s+open\s+https'),
+        'domain': re.compile(r'Nmap scan report for ([^\s]+)'),
+        'os': re.compile(r'Running: ([^\n]+)'),
+        'apache': re.compile(r'Apache'),
+        'nginx': re.compile(r'nginx'),
+        'sql': re.compile(r'MySQL|PostgreSQL|Microsoft SQL Server|Oracle Database')
+    }
+
+    details = {
+        'open_ports': set(),
+        'http_ports': set(),
+        'https_ports': set(),
+        'domain': None,
+        'os': None,
+        'services': set()
+    }
+
+    for key, pattern in patterns.items():
+        matches = pattern.findall(output)
+        if key == 'domain' and matches:
+            details[key] = matches[0]
+        elif key == 'os' and matches:
+            details[key] = matches[0]
+        elif key in [ 'Apache', 'apache', 'nginx', 'sql', 'ssh', 'http'] and matches:
+            details['services'].update(matches)
+        elif matches:
+            details[key].update(matches)
+
+    return details
 
 def extract_subdomains_from_file(file_path):
     subdomains = set()
@@ -68,7 +84,7 @@ def check_webproxy():
     return True
 
 def check_tor(ip):
-    command = f"proxychains curl -I http://{ip}"
+    command = f"proxychains curl http://{ip}"
     output, error = run_command(command, timeout=10)
     if "Failed to connect" in error:
         return False
@@ -103,8 +119,8 @@ def main():
     print(f"Sublist: {sublist}")
     print(f"Dirlist: {dirlist}")
 
-    rate, Tspeed = ('--min-rate 3000', '-T4') if speed == 0 else ('--max-rate 1000', '-T2')
-    webproxy, ffufwebpoxy = ('--proxy http://127.0.0.1:8080', '-x http://127.0.0.1:8080' ) if check_webproxy() else ''
+    speed_option = ('--min-rate 3000 -T4') if speed == 0 else ('--max-rate 1000 -T2')
+    webproxy, ffufwebproxy = '',''#('--proxy http://127.0.0.1:8080', '-x http://127.0.0.1:8080') if check_webproxy() else ('', '')
     tor = 'proxychains' if check_tor(IP) else ''
     print("Tor setting:", tor)
 
@@ -113,12 +129,11 @@ def main():
     outputs = current_working_directory
     
     prep = [
-        f'sudo mkdir {outputs}/scan',
-        f'sudo mkdir {outputs}/scan/Nmap',
-        f'sudo mkdir {outputs}/cherry',
-        f'sudo mkdir {outputs}/recon',
-        f'sudo mkdir {outputs}/attacks',
-        f'sudo mkdir {outputs}/zap',
+        f'sudo mkdir -p {outputs}/scan/Nmap',
+        f'sudo mkdir -p {outputs}/cherry',
+        f'sudo mkdir -p {outputs}/recon',
+        f'sudo mkdir -p {outputs}/attacks',
+        f'sudo mkdir -p {outputs}/zap',
         f'sudo chown -R {user}:{user} {outputs}/*'
     ]
 
@@ -131,22 +146,17 @@ def main():
     fingerprint = [
         f"{tor} ping -c 2 {IP}",
         f"{tor} sudo rustscan -t 2000 -b 2000 --ulimit 5000 -r 0-65535 -a {IP} | sudo tee rust.txt",
-        f"{tor} sudo nmap -p- {rate} {Tspeed} -vvv {IP} {webproxy} -oA {outputs}/scan/Nmap/ports",
-        f"{tor} sudo nmap -sL -vvv {IP} {webproxy} -oA {outputs}/scan/Nmap/DNS"
+        f"{tor} sudo nmap -p- {speed_option} {webproxy} -vvv {IP} -oA {outputs}/scan/Nmap/ports",
+        f"{tor} sudo nmap {speed_option} {webproxy} -vvv -A {IP} -oA {outputs}/scan/Nmap/full",
+        f"{tor} sudo nmap {speed_option} {webproxy} -vvv --script=vuln {IP} -oA {outputs}/scan/Nmap/vuln"
     ]
     
-    patterns = [
-        (r'Open \S+:(\d+)', 'open'),
-        (r'(\d+)/tcp\s+open', 'open'),
-        (r'(\d+)/tcp\s+open\s+http', 'http'),
-        (r'(\d+)/tcp\s+open\s+https', 'https'),
-        (r'Nmap scan report for ([^\s]+)', 'domain')
-    ]
-
     all_open_ports = set()
     http_ports = set()
     https_ports = set()
     domain_name = None
+    os_details = None
+    services = set()
 
     for command in fingerprint:
         print(f"Running command: {command}")
@@ -156,18 +166,16 @@ def main():
             pass
         else:
             print(f"Output from command '{command}': {output}")
-            if "ping" in command:
-                match = re.search(r'PING [^\(]+\(([^)]+)\)', output)
-                if match:
-                    IP = match.group(1)
-                    print(f"Resolved IP from ping: {IP}")
-            open_ports, http_ports_found, https_ports_found, extracted_domain = extract_ports_and_domain(output, patterns)
-            all_open_ports.update(open_ports)
-            http_ports.update(http_ports_found)
-            https_ports.update(https_ports_found)
-            if extracted_domain:
-                domain_name = extracted_domain
-            print(f"Open Ports from {command}:", open_ports)
+            details = extract_details(output)
+            all_open_ports.update(details['open_ports'])
+            http_ports.update(details['http_ports'])
+            https_ports.update(details['https_ports'])
+            if details['domain']:
+                domain_name = details['domain']
+            if details['os']:
+                os_details = details['os']
+            services.update(details['services'])
+            print(f"Details from {command}:", details)
     
     all_open_ports_list = list(all_open_ports)
     http_ports_list = list(http_ports)
@@ -184,6 +192,8 @@ def main():
         f.write(f"HTTP Ports: {http_ports_list}\n")
         f.write(f"HTTPS Ports: {https_ports_list}\n")
         f.write(f"Targets: {targets_string}\n")
+        f.write(f"OS Details: {os_details}\n")
+        f.write(f"Services: {', '.join(services)}\n")
 
     print("Domain:", domain_name)
     print("Domain to IP:", IP)
@@ -191,10 +201,13 @@ def main():
     print("HTTP Ports:", http_ports_list)
     print("HTTPS Ports:", https_ports_list)
     print("Targets:", targets_string)
+    print("OS Details:", os_details)
+    print("Services:", ", ".join(services))
     
     SubEnum = [
         f'{tor} ping -c 2 {domain_name}',
-        f'{tor} sudo ffuf -w {sublist} -u http://{domain_name}/ {ffufwebpoxy} -H "Host: FUZZ.{domain_name}" -fc 404 -fw 9 -o SubFfuf.txt > ffuf.log 2>&1'
+        f'{tor} sudo ffuf -w {sublist} -u http://{domain_name}/ -H "Host: FUZZ.{domain_name}" {ffufwebproxy} -fw 9  -t 125 -o SubFfuf.txt > ffufsub.log 2>&1',
+        f'{tor} sudo nikto -h http://{domain_name} -o {outputs}/scan/{domain_name}nikto.txt'
     ]
     
     for command in SubEnum:
@@ -212,15 +225,38 @@ def main():
                 with open(fingerprint_file, "a") as f:
                     f.write(f"Subdomains: {subdomains_string}\n")
 
-                for domain in subdomains:
-                    DirEnum = f'{tor} sudo feroxbuster -u "http://{domain}" -E -g -d 4 -B -w {dirlist} --threads 25  {webproxy} --silent -o {domain}dir'
-                    print(f"Running command: {DirEnum}")
-                    output, error = run_command(DirEnum)
-                    if error:
-                        print(f"Enum error with command '{DirEnum}': {error}")
-                        pass
-                    else:
-                        print(f"Output from command '{DirEnum}': {output}")
+                # List to store found directories and parameters
+                directories_and_params = []
+
+                # Run directory and parameter enumeration for each subdomain
+                for subdomain in subdomains:
+                    dir_enum_command = [
+                        f'{tor} ping -c 2 {subdomain}',
+                        f'{tor} sudo ffuf -w {dirlist} -u http://{subdomain}/FUZZ {ffufwebproxy} -fc 307 -recursion -o {subdomain}_dirs.txt -t 125 >> ffufdir.log 2>&1',
+                        f'{tor} sudo nikto -h http://{subdomain} -o {outputs}/scan/{subdomain}nikto.txt',
+                        ]
+                    for cmd in dir_enum_command:
+                        print(f"Running command: {cmd}")
+                        output, error = run_command(cmd)
+                        if error:
+                            print(f"Enum error with command '{cmd}': {error}")
+                        else:
+                            print(f"Output from command '{cmd}': {output}")
+
+                    try:
+                        with open("ffufdir.log", "r") as log_file:
+                            for line in log_file:
+                                if "Adding a new job to the queue:" in line:
+                                    found_url = line.split("Adding a new job to the queue: ")[1].strip()
+                                    print(f"Found URL: {found_url}")
+                                    directories_and_params.append(found_url)
+                    except Exception as e:
+                        print(f"Error reading directories from file: {e}")
+
+                # Save the found directories and parameters to a file
+                with open("directories_and_params.txt", "w") as file:
+                    for item in directories_and_params:
+                        file.write(f"{item}\n")
 
 if __name__ == "__main__":
     main()
