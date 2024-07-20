@@ -2,18 +2,17 @@
 # -*- coding: utf-8 -*-
 
 import os
-import subprocess
 import sys
 import re
 import json
 import asyncio
 import aiofiles
 import random
-import threading
-import time
 import curses
+import time
 
-async def run_command(command, timeout=60000, verbose=False, output_queue=None):
+# Run a shell command asynchronously with optional verbose output and queue
+async def run_command(command, timeout=60000, verbose=False, output_queue=None, log_file=None):
     try:
         proc = await asyncio.create_subprocess_shell(
             command,
@@ -26,19 +25,35 @@ async def run_command(command, timeout=60000, verbose=False, output_queue=None):
                 if not line:
                     break
                 if output_queue:
-                    await output_queue.put(f"scanning... {command}")
+                    await output_queue.put(f"scanning... {command}: {line.decode().strip()}")
+                if log_file:
+                    async with aiofiles.open(log_file, 'a') as f:
+                        await f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {line.decode().strip()}\n")
+                await asyncio.sleep(5)  # Adding delay to show progress for at least 5 seconds
         else:
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            if log_file:
+                async with aiofiles.open(log_file, 'a') as f:
+                    await f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {stdout.decode().strip()}\n")
             return stdout.decode(), stderr.decode()
     except asyncio.TimeoutError:
+        message = f"scanning... {command}: Command timed out."
         if output_queue:
-            await output_queue.put(f"scanning... {command}: Command timed out.")
+            await output_queue.put(message)
+        if log_file:
+            async with aiofiles.open(log_file, 'a') as f:
+                await f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {message}\n")
         return "", "Command timed out."
     except Exception as e:
+        message = f"scanning... {command}: {str(e)}"
         if output_queue:
-            await output_queue.put(f"scanning... {command}: {str(e)}")
+            await output_queue.put(message)
+        if log_file:
+            async with aiofiles.open(log_file, 'a') as f:
+                await f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {message}\n")
         return "", str(e)
 
+# Create a directory asynchronously if it doesn't exist
 async def create_directory(path):
     if not os.path.exists(path):
         os.makedirs(path)
@@ -46,21 +61,24 @@ async def create_directory(path):
     else:
         print(f"Directory '{path}' already exists.")
 
+# Read a file asynchronously
 async def read_file(file_path):
     async with aiofiles.open(file_path, 'r') as file:
         return await file.read()
 
+# Write content to a file asynchronously
 async def write_file(file_path, content):
     async with aiofiles.open(file_path, 'w') as file:
         await file.write(content)
 
+# Extract details from command output using regular expressions
 def extract_details(output):
     patterns = {
         'open_ports': re.compile(r'(\d+)/tcp\s+open'),
         'http_ports': re.compile(r'(\d+)/tcp\s+open\s+http'),
         'https_ports': re.compile(r'(\d+)/tcp\s+open\s+https'),
         'domain': re.compile(r'Nmap scan report for ([^\s]+)'),
-        'os': re.compile(r'Running: ([^\n]+)'),
+        'os': re.compile(r'Linux|Windows'),
         'apache': re.compile(r'Apache'),
         'nginx': re.compile(r'nginx'),
         'sql': re.compile(r'MySQL|PostgreSQL|Microsoft SQL Server|Oracle Database')
@@ -88,17 +106,20 @@ def extract_details(output):
 
     return details
 
+# Extract subdomains from a JSON file asynchronously
 async def extract_subdomains_from_file(file_path):
     subdomains = set()
     try:
         async with aiofiles.open(file_path, 'r') as file:
-            data = json.load(file)
+            data = await file.read()
+            data = json.loads(data)
             for result in data['results']:
                 subdomains.add(result['host'])
     except Exception as e:
         print(f"Error reading subdomains from file: {e}")
     return list(subdomains)
 
+# Check if a web proxy is available asynchronously
 async def check_webproxy():
     command = "curl -I http://127.0.0.1:8080"
     output, error = await run_command(command, timeout=10)
@@ -106,6 +127,7 @@ async def check_webproxy():
         return False
     return True
 
+# Check if Tor is available for a given IP asynchronously
 async def check_tor(ip):
     command = f"proxychains curl http://{ip}"
     output, error = await run_command(command, timeout=10)
@@ -113,11 +135,26 @@ async def check_tor(ip):
         return False
     return True
 
+# Ensure the script is run as root
 def check_root():
     if os.geteuid() != 0:
         print("This script must be run as root. Please rerun with 'sudo'.")
         sys.exit(1)
 
+# Update fingerprint file
+async def update_fingerprint(fingerprint_file, details):
+    async with aiofiles.open(fingerprint_file, "w") as f:
+        await f.write(f"Proxys: {details['tor']}, {details['webproxy']}, {details['ffuf2burp']} \n")
+        await f.write(f"Domain: {details['domain_name']}\n")
+        await f.write(f"Domain to IP: {details['IP']}\n")
+        await f.write(f"All Open Ports: {list(details['open_ports'])}\n")
+        await f.write(f"HTTP Ports: {list(details['http_ports'])}\n")
+        await f.write(f"HTTPS Ports: {list(details['https_ports'])}\n")
+        await f.write(f"Targets: {details['targets_string']}\n")
+        await f.write(f"OS Details: {details['os_details']}\n")
+        await f.write(f"Services: {', '.join(details['services'])}\n")
+
+# Main function that orchestrates the entire scanning process
 async def main(output_queue):
     check_root()
 
@@ -142,14 +179,16 @@ async def main(output_queue):
     print(f"Sublist: {sublist}")
     print(f"Dirlist: {dirlist}")
 
-    speed_option = ('--min-rate 3000 -T4') if speed == 0 else ('--max-rate 1000 -T2')
-    webproxy = '' # '--proxy http://127.0.0.1:8080' if await check_webproxy() else ''
+    speed_option = ('--min-rate 5000 -T4') if speed == 0 else ('--max-rate 1000 -T2')
+    webproxy, ffuf2burp = '', '-replay-proxy http://127.0.0.1:8080' if await check_webproxy() else ''
     tor = 'proxychains' if await check_tor(IP) else ''
     print("Tor setting:", tor)
 
     current_working_directory = os.getcwd()
     print("Current working directory:", current_working_directory)
     outputs = current_working_directory
+
+    log_file = os.path.join(outputs, "script_log.txt")
     
     prep = [
         f'sudo mkdir -p {outputs}/scan/Nmap',
@@ -160,129 +199,114 @@ async def main(output_queue):
         f'sudo chown -R {user}:{user} {outputs}/*'
     ]
 
-    prep_tasks = [run_command(command) for command in prep]
+    prep_tasks = [run_command(command, log_file=log_file) for command in prep]
     await asyncio.gather(*prep_tasks)
 
-    fingerprint = [
+    fingerprint_commands = [
         f"{tor} ping -c 2 {IP}",
         f"{tor} sudo rustscan -t 2000 -b 2000 --ulimit 5000 -r 0-65535 -a {IP} | sudo tee rust.txt",
         f"{tor} sudo nmap -p- {speed_option} {webproxy} -vvv {IP} -oA {outputs}/scan/Nmap/ports",
-        f"{tor} sudo nmap {speed_option} {webproxy} -vvv -A {IP} -oA {outputs}/scan/Nmap/full",
+        f"{tor} sudo nmap {speed_option} {webproxy} -vvv -sn {IP} -oA {outputs}/scan/Nmap/host",
+        f"{tor} sudo nmap {speed_option} {webproxy} -vvv -O {IP} -oA {outputs}/scan/Nmap/OS",
+        f"{tor} sudo nmap {speed_option} {webproxy} -vvv -sC {IP} -oA {outputs}/scan/Nmap/script",
+        f"{tor} sudo nmap {speed_option} {webproxy} -vvv -sV {IP} -oA {outputs}/scan/Nmap/version",
+        f"{tor} sudo nmap {speed_option} {webproxy} -vvv --traceroute {IP} -oA {outputs}/scan/Nmap/trace",
         f"{tor} sudo nmap {speed_option} {webproxy} -vvv --script=vuln {IP} -oA {outputs}/scan/Nmap/vuln"
     ]
 
-    verbose_command = random.choice(fingerprint)
-    print(f"Running command with verbose output: {verbose_command}")
+    print(f"Running all commands in fingerprint concurrently...")
 
-    # Run the verbose command
-    await run_command(verbose_command, verbose=True, output_queue=output_queue)
+    details = {
+        'tor': tor,
+        'webproxy': webproxy,
+        'ffuf2burp': ffuf2burp,
+        'IP': IP,
+        'open_ports': set(),
+        'http_ports': set(),
+        'https_ports': set(),
+        'domain_name': None,
+        'os_details': None,
+        'services': set(),
+        'targets_string': ""
+    }
 
-    # Run the remaining commands asynchronously
-    remaining_commands = [cmd for cmd in fingerprint if cmd != verbose_command]
-    fingerprint_tasks = [run_command(command, output_queue=output_queue) for command in remaining_commands]
+    fingerprint_tasks = [run_command(command, output_queue=output_queue, log_file=log_file) for command in fingerprint_commands]
     results = await asyncio.gather(*fingerprint_tasks)
 
-    all_open_ports = set()
-    http_ports = set()
-    https_ports = set()
-    domain_name = None
-    os_details = None
-    services = set()
-
     for output, error in results:
         if error:
             await output_queue.put(f"Error: {error}")
             continue
         await output_queue.put(f"Output: {output}")
-        details = extract_details(output)
-        all_open_ports.update(details['open_ports'])
-        http_ports.update(details['http_ports'])
-        https_ports.update(details['https_ports'])
-        if details['domain']:
-            domain_name = details['domain']
-        if details['os']:
-            os_details = details['os']
-        services.update(details['services'])
+        scan_details = extract_details(output)
+        details['open_ports'].update(scan_details['open_ports'])
+        details['http_ports'].update(scan_details['http_ports'])
+        details['https_ports'].update(scan_details['https_ports'])
+        if scan_details['domain']:
+            details['domain_name'] = scan_details['domain']
+        if scan_details['os']:
+            details['os_details'] = scan_details['os']
+        details['services'].update(scan_details['services'])
 
-    all_open_ports_list = list(all_open_ports)
-    http_ports_list = list(http_ports)
-    https_ports_list = list(https_ports)
+        targets = [f"{IP}:{port}" for port in details['http_ports'] | details['https_ports']]
+        details['targets_string'] = ", ".join(targets)
 
-    targets = [f"{IP}:{port}" for port in http_ports_list + https_ports_list]
-    targets_string = ", ".join(targets)
+        # Update fingerprint file after each scan
+        fingerprint_file = os.path.join(outputs, "fingerprint.txt")
+        await update_fingerprint(fingerprint_file, details)
 
-    fingerprint_file = os.path.join(outputs, "fingerprint.txt")
-    async with aiofiles.open(fingerprint_file, "w") as f:
-        await f.write(f"Domain: {domain_name}\n")
-        await f.write(f"Domain to IP: {IP}\n")
-        await f.write(f"All Open Ports: {all_open_ports_list}\n")
-        await f.write(f"HTTP Ports: {http_ports_list}\n")
-        await f.write(f"HTTPS Ports: {https_ports_list}\n")
-        await f.write(f"Targets: {targets_string}\n")
-        await f.write(f"OS Details: {os_details}\n")
-        await f.write(f"Services: {', '.join(services)}\n")
-
-    print("Domain:", domain_name)
+    print("Domain:", details['domain_name'])
     print("Domain to IP:", IP)
-    print("All Open Ports:", all_open_ports_list)
-    print("HTTP Ports:", http_ports_list)
-    print("HTTPS Ports:", https_ports_list)
-    print("Targets:", targets_string)
-    print("OS Details:", os_details)
-    print("Services:", ", ".join(services))
+    print("All Open Ports:", list(details['open_ports']))
+    print("HTTP Ports:", list(details['http_ports']))
+    print("HTTPS Ports:", list(details['https_ports']))
+    print("Targets:", details['targets_string'])
+    print("OS Details:", details['os_details'])
+    print("Services:", ", ".join(details['services']))
 
-    SubEnum = [
-        f'{tor} ping -c 2 {domain_name}',
-        f'{tor} sudo ffuf -w {sublist} -u http://{domain_name}/ -H "Host: FUZZ.{domain_name}" {webproxy} -fw 9  -t 125 -o SubFfuf.txt > ffufsub.log 2>&1',
-        f'{tor} sudo nikto -h http://{domain_name} -o {outputs}/scan/{domain_name}nikto.txt'
-    ]
+    # Subdomain enumeration and directory enumeration for each found subdomain
+    subdomain_enum_command = f'{tor} sudo ffuf -w {sublist} -u http://{details["domain_name"]}/ -H "Host: FUZZ.{details["domain_name"]}" {ffuf2burp} -fw 9  -t 125 -o SubFfuf.txt > ffufsub.log 2>&1'
+    await run_command(subdomain_enum_command, output_queue=output_queue, log_file=log_file)
+    
+    # As subdomains are found, start directory enumeration
+    subdomains = await extract_subdomains_from_file("SubFfuf.txt")
+    dir_enum_tasks = []
+    directories_and_params = []
+    ffuf_logs = ["ffufsub.log"]
 
-    subenum_tasks = [run_command(command, output_queue=output_queue) for command in SubEnum]
-    results = await asyncio.gather(*subenum_tasks)
+    for subdomain in subdomains:
+        dir_enum_command = [
+            f'{tor} ping -c 2 {subdomain}',
+            f'{tor} sudo ffuf -w {dirlist} -u http://{subdomain}/FUZZ {ffuf2burp} -fc 307 -recursion -o {subdomain}_dirs.txt -t 125 > {subdomain}ffufdir.log 2>&1'
+        ]
+        dir_enum_tasks.extend([run_command(cmd, output_queue=output_queue, log_file=log_file) for cmd in dir_enum_command])
+        ffuf_logs.append(f"{subdomain}ffufdir.log")
 
-    for output, error in results:
-        if error:
-            await output_queue.put(f"Error: {error}")
-            continue
-        await output_queue.put(f"Output: {output}")
-        if "ffuf" in output:
-            subdomains = await extract_subdomains_from_file("SubFfuf.txt")
-            subdomains_string = ", ".join(subdomains)
-            print("Subdomains found:", subdomains_string)
-            async with aiofiles.open(fingerprint_file, "a") as f:
-                await f.write(f"Subdomains: {subdomains_string}\n")
+    # Run directory enumeration tasks concurrently
+    await asyncio.gather(*dir_enum_tasks)
 
-            directories_and_params = []
+    # Collect directory enumeration results
+    for subdomain in subdomains:
+        try:
+            async with aiofiles.open(f"{subdomain}ffufdir.log", "r") as log_file:
+                async for line in log_file:
+                    if "Adding a new job to the queue:" in line:
+                        found_url = line.split("Adding a new job to the queue: ")[1].strip()
+                        print(f"Found URL: {found_url}")
+                        directories_and_params.append(found_url)
+        except FileNotFoundError:
+            print(f"{subdomain}ffufdir.log not found, skipping directory extraction for {subdomain}.")
 
-            for subdomain in subdomains:
-                dir_enum_command = [
-                    f'{tor} ping -c 2 {subdomain}',
-                    f'{tor} sudo ffuf -w {dirlist} -u http://{subdomain}/FUZZ {webproxy} -fc 307 -recursion -o {subdomain}_dirs.txt -t 125 >> ffufdir.log 2>&1',
-                    f'{tor} sudo nikto -h http://{subdomain} -o {outputs}/scan/{subdomain}nikto.txt',
-                ]
-                dir_enum_tasks = [run_command(cmd, output_queue=output_queue) for cmd in dir_enum_command]
-                await asyncio.gather(*dir_enum_tasks)
+    async with aiofiles.open("directories_and_params.txt", "w") as file:
+        for item in directories_and_params:
+            await file.write(f"{item}\n")
 
-                async with aiofiles.open("ffufdir.log", "r") as log_file:
-                    async for line in log_file:
-                        if "Adding a new job to the queue:" in line:
-                            found_url = line.split("Adding a new job to the queue: ")[1].strip()
-                            print(f"Found URL: {found_url}")
-                            directories_and_params.append(found_url)
+    async with aiofiles.open("ffuf_logs.txt", "w") as file:
+        for log in ffuf_logs:
+            await file.write(f"{log}\n")
 
-            async with aiofiles.open("directories_and_params.txt", "w") as file:
-                for item in directories_and_params:
-                    await file.write(f"{item}\n")
-
-async def display_output(output_queue):
-    while True:
-        message = await output_queue.get()
-        if message:
-            sys.stdout.write(f"\r{message}")
-            sys.stdout.flush()
-            await asyncio.sleep(10)
-
-def play_snake_game(stdscr, output_queue, fingerprint_file):
+# Display output using curses
+async def display_output(stdscr, output_queue, fingerprint_file):
     WIDTH = 20
     HEIGHT = 10
     SNAKE_CHAR = 'O'
@@ -302,10 +326,11 @@ def play_snake_game(stdscr, output_queue, fingerprint_file):
     }
 
     class SnakeGame:
-        def __init__(self, snake_win, info_win, fingerprint_file):
+        def __init__(self, snake_win, info_win, fingerprint_file, output_queue):
             self.snake_win = snake_win
             self.info_win = info_win
             self.fingerprint_file = fingerprint_file
+            self.output_queue = output_queue
             self.initialize_game()
 
         def initialize_game(self):
@@ -370,56 +395,66 @@ def play_snake_game(stdscr, output_queue, fingerprint_file):
             self.snake_win.addstr(f'Score: {len(self.snake) - 1}\n')
             self.snake_win.refresh()
 
-        def play(self):
+        async def play(self):
             while True:
                 self.initialize_game()
                 while not self.game_over:
                     self.display()
                     self.change_direction()
                     self.move_snake()
-                    self.update_info_win()
-                    time.sleep(0.2)
+                    await self.update_info_win()
+                    await asyncio.sleep(0.2)
                 self.display()
                 try:
                     self.snake_win.addstr('Game Over!\n')
                     self.snake_win.refresh()
-                    time.sleep(2)
+                    await asyncio.sleep(2)
                 except curses.error:
                     pass
 
-        def update_info_win(self):
+        async def update_info_win(self):
             self.info_win.clear()
             self.info_win.addstr('Scanning...\n')
             try:
-                with open(self.fingerprint_file, 'r') as file:
-                    for line in file:
+                async with aiofiles.open(self.fingerprint_file, 'r') as file:
+                    async for line in file:
                         self.info_win.addstr(line)
             except FileNotFoundError:
                 self.info_win.addstr('Fingerprint file not found.\n')
             except curses.error:
                 pass  # Ignore curses errors caused by trying to write too much text
+            while not self.output_queue.empty():
+                message = await self.output_queue.get()
+                lines = message.split('\n')
+                for line in lines:
+                    try:
+                        self.info_win.addstr(line[:self.info_win.getmaxyx()[1] - 1] + '\n')
+                    except curses.error:
+                        pass
             self.info_win.refresh()
 
-    def run_snake_game(stdscr):
-        curses.curs_set(0)
-        curses.start_color()
-        for i in range(1, 8):
-            curses.init_pair(i, i, curses.COLOR_BLACK)
-        snake_win = curses.newwin(HEIGHT + 2, WIDTH + 2, 0, 0)
-        info_win = curses.newwin(HEIGHT + 2, WIDTH * 2, 0, WIDTH + 3)
-        game = SnakeGame(snake_win, info_win, fingerprint_file)
-        game.play()
+    curses.curs_set(0)
+    curses.start_color()
+    for i in range(1, 8):
+        curses.init_pair(i, i, curses.COLOR_BLACK)
+    snake_win = curses.newwin(HEIGHT + 2, WIDTH + 2, 0, 0)
+    info_win = curses.newwin(HEIGHT + 2, WIDTH * 2, 0, WIDTH + 3)
+    game = SnakeGame(snake_win, info_win, fingerprint_file, output_queue)
+    await game.play()
 
-    try:
-        curses.wrapper(run_snake_game)
-    except curses.error:
-        pass
+# Main program entry point
+async def main_program():
+    output_queue = asyncio.Queue()
+    fingerprint_file = os.path.join(os.getcwd(), "fingerprint.txt")
+
+    # Start the main task
+    main_task = asyncio.create_task(main(output_queue))
+    # Start the display output task within the curses environment
+    curses_task = asyncio.create_task(curses.wrapper(display_output, output_queue, fingerprint_file))
+
+    # Run both tasks concurrently
+    await asyncio.gather(main_task, curses_task)
 
 if __name__ == "__main__":
-    output_queue = asyncio.Queue()
-    main_thread = threading.Thread(target=asyncio.run, args=(main(output_queue),))
-    main_thread.start()
-    display_thread = threading.Thread(target=asyncio.run, args=(display_output(output_queue),))
-    display_thread.start()
-    fingerprint_file = os.path.join(os.getcwd(), "fingerprint.txt")
-    curses.wrapper(play_snake_game, output_queue, fingerprint_file)
+    # Use asyncio.run to start the main_program
+    asyncio.run(main_program())
