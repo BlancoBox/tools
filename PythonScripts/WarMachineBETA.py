@@ -7,9 +7,37 @@ import re
 import json
 import asyncio
 import aiofiles
+import requests
 import random
 import curses
 import time
+
+# Function to fetch URL content and extract API calls with potential injectable parameters
+async def fetch_and_extract_api_calls(url, scope):
+    async def fetch_content(url):
+        try:
+            response = requests.get(url)
+            response.raise_for_status()
+            return response.text
+        except requests.exceptions.RequestException as e:
+            print(f"Error fetching {url}: {e}")
+            return None
+
+    def extract_api_calls(content, scope):
+        api_calls = set()
+        # Use regex to find all URLs
+        pattern = re.compile(r'https?://[^\s\'"<>]+')
+        matches = pattern.findall(content)
+        for match in matches:
+            # Check if the URL is within the specified scope and has query parameters
+            if scope in match and '?' in match:
+                api_calls.add(match)
+        return api_calls
+
+    content = await fetch_content(url)
+    if content:
+        return extract_api_calls(content, scope)
+    return set()
 
 # Run a shell command asynchronously with optional verbose output and queue
 async def run_command(command, timeout=60000, verbose=False, output_queue=None, log_file=None):
@@ -68,7 +96,7 @@ async def read_file(file_path):
 
 # Write content to a file asynchronously
 async def write_file(file_path, content):
-    async with aiofiles.open(file_path, 'w') as file:
+    async with aiofiles.open(file_path, 'a') as file:  # 'a' mode to append content
         await file.write(content)
 
 # Extract details from command output using regular expressions
@@ -153,6 +181,21 @@ async def update_fingerprint(fingerprint_file, details):
         await f.write(f"Targets: {details['targets_string']}\n")
         await f.write(f"OS Details: {details['os_details']}\n")
         await f.write(f"Services: {', '.join(details['services'])}\n")
+
+# Function to process URLs from the queue and extract API calls
+async def process_urls(url_queue, all_api_calls, output_queue, api_calls_file, discovered_urls_file):
+    while True:
+        url = await url_queue.get()
+        api_calls = await fetch_and_extract_api_calls(url, "vulnnet.thm")
+        all_api_calls.update(api_calls)
+        # Write discovered API calls to the file
+        async with aiofiles.open(api_calls_file, 'a') as file:
+            for api_call in api_calls:
+                await file.write(f"{api_call}\n")
+        # Write discovered URL to the file
+        async with aiofiles.open(discovered_urls_file, 'a') as file:
+            await file.write(f"{url}\n")
+        url_queue.task_done()
 
 # Main function that orchestrates the entire scanning process
 async def main(output_queue):
@@ -268,39 +311,63 @@ async def main(output_queue):
     subdomain_enum_command = f'{tor} sudo ffuf -w {sublist} -u http://{details["domain_name"]}/ -H "Host: FUZZ.{details["domain_name"]}" {ffuf2burp} -fw 9  -t 125 -o SubFfuf.txt > ffufsub.log 2>&1'
     await run_command(subdomain_enum_command, output_queue=output_queue, log_file=log_file)
     
-    # As subdomains are found, start directory enumeration
+    # Initialize sets for subdomains, directories, and discovered API calls
+    discovered_urls = set()
     subdomains = await extract_subdomains_from_file("SubFfuf.txt")
-    dir_enum_tasks = []
+    discovered_urls.update(subdomains)
     directories_and_params = []
     ffuf_logs = ["ffufsub.log"]
+    all_api_calls = set()
+    api_calls_file = "api_calls.txt"
+    discovered_urls_file = "discovered_urls.txt"
 
-    for subdomain in subdomains:
-        dir_enum_command = [
-            f'{tor} ping -c 2 {subdomain}',
-            f'{tor} sudo ffuf -w {dirlist} -u http://{subdomain}/FUZZ {ffuf2burp} -fc 307 -recursion -o {subdomain}_dirs.txt -t 125 > {subdomain}ffufdir.log 2>&1'
-        ]
-        dir_enum_tasks.extend([run_command(cmd, output_queue=output_queue, log_file=log_file) for cmd in dir_enum_command])
-        ffuf_logs.append(f"{subdomain}ffufdir.log")
+    # Create a URL queue for processing URLs
+    url_queue = asyncio.Queue()
+    for url in discovered_urls:
+        await url_queue.put(url)
 
-    # Run directory enumeration tasks concurrently
-    await asyncio.gather(*dir_enum_tasks)
+    # Start URL processing tasks
+    url_processors = [asyncio.create_task(process_urls(url_queue, all_api_calls, output_queue, api_calls_file, discovered_urls_file)) for _ in range(5)]
 
-    # Collect directory enumeration results
-    for subdomain in subdomains:
-        try:
-            async with aiofiles.open(f"{subdomain}ffufdir.log", "r") as log_file:
-                async for line in log_file:
-                    if "Adding a new job to the queue:" in line:
-                        found_url = line.split("Adding a new job to the queue: ")[1].strip()
-                        print(f"Found URL: {found_url}")
-                        directories_and_params.append(found_url)
-        except FileNotFoundError:
-            print(f"{subdomain}ffufdir.log not found, skipping directory extraction for {subdomain}.")
+    # Process subdomains and directories
+    while not url_queue.empty() or not all(url_queue.empty() for processor in url_processors):
+        dir_enum_tasks = []
+        for subdomain in subdomains:
+            dir_enum_command = f'{tor} feroxbuster --url http://{subdomain} -o {subdomain}_dirs.txt > {subdomain}feroxdir.log 2>&1'
+            dir_enum_tasks.append(run_command(dir_enum_command, output_queue=output_queue, log_file=log_file))
+            ffuf_logs.append(f"{subdomain}feroxdir.log")
+            discovered_urls.add(f"http://{subdomain}/")
 
-    async with aiofiles.open("directories_and_params.txt", "w") as file:
-        for item in directories_and_params:
-            await file.write(f"{item}\n")
+        # Run directory enumeration tasks concurrently
+        await asyncio.gather(*dir_enum_tasks)
 
+        # Collect directory enumeration results and extract API calls
+        new_subdomains = set()
+        for subdomain in subdomains:
+            try:
+                async with aiofiles.open(f"{subdomain}feroxdir.log", "r") as log_file:
+                    async for line in log_file:
+                        if "Adding a new job to the queue:" in line:
+                            found_url = line.split("Adding a new job to the queue: ")[1].strip()
+                            print(f"Found URL: {found_url}")
+                            directories_and_params.append(found_url)
+                            new_subdomains.add(found_url)
+                            discovered_urls.add(found_url)
+                            await url_queue.put(found_url)  # Add new URL to the queue for processing
+                            # Write discovered URLs to the file immediately
+                            async with aiofiles.open(discovered_urls_file, 'a') as url_file:
+                                await url_file.write(f"{found_url}\n")
+            except FileNotFoundError:
+                print(f"{subdomain}feroxdir.log not found, skipping directory extraction for {subdomain}.")
+
+        subdomains = new_subdomains
+
+    # Wait for all URL processors to finish
+    await url_queue.join()
+    for processor in url_processors:
+        processor.cancel()
+
+    # Save discovered URLs and directories to files
     async with aiofiles.open("ffuf_logs.txt", "w") as file:
         for log in ffuf_logs:
             await file.write(f"{log}\n")
