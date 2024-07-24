@@ -186,7 +186,7 @@ async def update_fingerprint(fingerprint_file, details):
 async def process_urls(url_queue, all_api_calls, output_queue, api_calls_file, discovered_urls_file):
     while True:
         url = await url_queue.get()
-        api_calls = await fetch_and_extract_api_calls(url, "vulnnet.thm")
+        api_calls = await fetch_and_extract_api_calls(url, discovered_urls_file)
         all_api_calls.update(api_calls)
         # Write discovered API calls to the file
         async with aiofiles.open(api_calls_file, 'a') as file:
@@ -222,7 +222,7 @@ async def main(output_queue):
     print(f"Sublist: {sublist}")
     print(f"Dirlist: {dirlist}")
 
-    speed_option = ('--min-rate 5000 -T4') if speed == 0 else ('--max-rate 1000 -T2')
+    speed_option = ('--min-rate 6000 -T4') if speed == 0 else ('--max-rate 1000 -T2')
     webproxy, ffuf2burp = '', '-replay-proxy http://127.0.0.1:8080' if await check_webproxy() else ''
     tor = 'proxychains' if await check_tor(IP) else ''
     print("Tor setting:", tor)
@@ -298,25 +298,18 @@ async def main(output_queue):
         fingerprint_file = os.path.join(outputs, "fingerprint.txt")
         await update_fingerprint(fingerprint_file, details)
 
-    print("Domain:", details['domain_name'])
-    print("Domain to IP:", IP)
-    print("All Open Ports:", list(details['open_ports']))
-    print("HTTP Ports:", list(details['http_ports']))
-    print("HTTPS Ports:", list(details['https_ports']))
-    print("Targets:", details['targets_string'])
-    print("OS Details:", details['os_details'])
-    print("Services:", ", ".join(details['services']))
-
     # Subdomain enumeration and directory enumeration for each found subdomain
-    subdomain_enum_command = f'{tor} sudo ffuf -w {sublist} -u http://{details["domain_name"]}/ -H "Host: FUZZ.{details["domain_name"]}" {ffuf2burp} -fw 9  -t 125 -o SubFfuf.txt > ffufsub.log 2>&1'
+    EnumSub = f'{outputs}/recon/SubFfuf.txt'
+    SubLog = f'{outputs}/recon/ffufsub.log'
+    subdomain_enum_command = f'{tor} sudo ffuf -w {sublist} -u http://{details["domain_name"]}/ -H "Host: FUZZ.{details["domain_name"]}" {ffuf2burp} -fw 9  -t 125 -o {EnumSub} > {SubLog} 2>&1'
     await run_command(subdomain_enum_command, output_queue=output_queue, log_file=log_file)
     
     # Initialize sets for subdomains, directories, and discovered API calls
     discovered_urls = set()
-    subdomains = await extract_subdomains_from_file("SubFfuf.txt")
+    subdomains = await extract_subdomains_from_file(EnumSub)
     discovered_urls.update(subdomains)
     directories_and_params = []
-    ffuf_logs = ["ffufsub.log"]
+    enum_logs = [SubLog]
     all_api_calls = set()
     api_calls_file = "api_calls.txt"
     discovered_urls_file = "discovered_urls.txt"
@@ -333,9 +326,11 @@ async def main(output_queue):
     while not url_queue.empty() or not all(url_queue.empty() for processor in url_processors):
         dir_enum_tasks = []
         for subdomain in subdomains:
-            dir_enum_command = f'{tor} feroxbuster --url http://{subdomain} -o {subdomain}_dirs.txt > {subdomain}feroxdir.log 2>&1'
+            EnumDir = f'{outputs}/recon/{subdomain}dir.txt'
+            DirLog = f'{outputs}/recon/{subdomain}dir.log'
+            dir_enum_command = f'{tor} feroxbuster --url http://{subdomain} --silent -o {EnumDir} >> {DirLog} 2>&1'
             dir_enum_tasks.append(run_command(dir_enum_command, output_queue=output_queue, log_file=log_file))
-            ffuf_logs.append(f"{subdomain}feroxdir.log")
+            enum_logs.append(DirLog)
             discovered_urls.add(f"http://{subdomain}/")
 
         # Run directory enumeration tasks concurrently
@@ -368,8 +363,8 @@ async def main(output_queue):
         processor.cancel()
 
     # Save discovered URLs and directories to files
-    async with aiofiles.open("ffuf_logs.txt", "w") as file:
-        for log in ffuf_logs:
+    async with aiofiles.open("enum_logs.txt", "w") as file:
+        for log in enum_logs:
             await file.write(f"{log}\n")
 
 # Display output using curses
