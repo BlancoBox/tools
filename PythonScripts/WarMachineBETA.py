@@ -13,14 +13,14 @@ import curses
 import time
 
 # Function to fetch URL content and extract API calls with potential injectable parameters
-async def fetch_and_extract_api_calls(url, scope):
+async def fetch_and_extract_api_calls(url, scope, output_queue):
     async def fetch_content(url):
         try:
             response = requests.get(url)
             response.raise_for_status()
             return response.text
         except requests.exceptions.RequestException as e:
-            print(f"Error fetching {url}: {e}")
+            await output_queue.put(f"Error fetching {url}: {e}")
             return None
 
     def extract_api_calls(content, scope):
@@ -36,7 +36,10 @@ async def fetch_and_extract_api_calls(url, scope):
 
     content = await fetch_content(url)
     if content:
-        return extract_api_calls(content, scope)
+        api_calls = extract_api_calls(content, scope)
+        for api_call in api_calls:
+            await output_queue.put(f"Discovered API call: {api_call}")
+        return api_calls
     return set()
 
 # Run a shell command asynchronously with optional verbose output and queue
@@ -96,7 +99,7 @@ async def read_file(file_path):
 
 # Write content to a file asynchronously
 async def write_file(file_path, content):
-    async with aiofiles.open(file_path, 'a') as file:  # 'a' mode to append content
+    async with aiofiles.open(file_path, 'w') as file:
         await file.write(content)
 
 # Extract details from command output using regular expressions
@@ -182,25 +185,19 @@ async def update_fingerprint(fingerprint_file, details):
         await f.write(f"OS Details: {details['os_details']}\n")
         await f.write(f"Services: {', '.join(details['services'])}\n")
 
-# Function to process URLs from the queue and extract API calls
-async def process_urls(url_queue, all_api_calls, output_queue, api_calls_file, discovered_urls_file):
+# Consumer function to process URLs and extract API calls
+async def process_urls(url_queue, api_calls_set, output_queue):
     while True:
         url = await url_queue.get()
-        api_calls = await fetch_and_extract_api_calls(url, discovered_urls_file)
-        all_api_calls.update(api_calls)
-        # Write discovered API calls to the file
-        async with aiofiles.open(api_calls_file, 'a') as file:
-            for api_call in api_calls:
-                await file.write(f"{api_call}\n")
-        # Write discovered URL to the file
-        async with aiofiles.open(discovered_urls_file, 'a') as file:
-            await file.write(f"{url}\n")
+        api_calls = await fetch_and_extract_api_calls(url, "vulnnet.thm", output_queue)
+        api_calls_set.update(api_calls)
         url_queue.task_done()
 
 # Main function that orchestrates the entire scanning process
 async def main(output_queue):
     check_root()
 
+    # Ensure correct usage
     if len(sys.argv) != 5:
         print("Usage: python3 script_name.py <arg1> <arg2> <arg3> <arg4>")
         print("sudo python3 ~/tools/PythonScripts/WarMachineBETA.py <IP> <user> <EnumLV:0|1|2> (1 = Smaller wordlist) <speed:0|1> (0 = A faster scan 'LOUDER'")
@@ -210,6 +207,7 @@ async def main(output_queue):
 
     IP, user, EnumLV, speed = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
     
+    # Set sublist and dirlist based on enumeration level
     if EnumLV == 0:
         sublist, dirlist = ('/usr/share/seclists/Discovery/DNS/subdomains-top1million-5000.txt', '/usr/share/seclists/Discovery/Web-Content/directory-list-2.3-small.txt')
     elif EnumLV == 1:
@@ -222,7 +220,10 @@ async def main(output_queue):
     print(f"Sublist: {sublist}")
     print(f"Dirlist: {dirlist}")
 
-    speed_option = ('--min-rate 6000 -T4') if speed == 0 else ('--max-rate 1000 -T2')
+    # Set speed options
+    speed_option = ('--min-rate 5000 -T4') if speed == 0 else ('--max-rate 1000 -T2')
+    
+    # Check for web proxy and Tor
     webproxy, ffuf2burp = '', '-replay-proxy http://127.0.0.1:8080' if await check_webproxy() else ''
     tor = 'proxychains' if await check_tor(IP) else ''
     print("Tor setting:", tor)
@@ -233,6 +234,7 @@ async def main(output_queue):
 
     log_file = os.path.join(outputs, "script_log.txt")
     
+    # Create necessary directories
     prep = [
         f'sudo mkdir -p {outputs}/scan/Nmap',
         f'sudo mkdir -p {outputs}/cherry',
@@ -245,6 +247,7 @@ async def main(output_queue):
     prep_tasks = [run_command(command, log_file=log_file) for command in prep]
     await asyncio.gather(*prep_tasks)
 
+    # Define fingerprint commands
     fingerprint_commands = [
         f"{tor} ping -c 2 {IP}",
         f"{tor} sudo rustscan -t 2000 -b 2000 --ulimit 5000 -r 0-65535 -a {IP} | sudo tee rust.txt",
@@ -273,6 +276,7 @@ async def main(output_queue):
         'targets_string': ""
     }
 
+    # Execute fingerprint commands
     fingerprint_tasks = [run_command(command, output_queue=output_queue, log_file=log_file) for command in fingerprint_commands]
     results = await asyncio.gather(*fingerprint_tasks)
 
@@ -311,8 +315,8 @@ async def main(output_queue):
     directories_and_params = []
     enum_logs = [SubLog]
     all_api_calls = set()
-    api_calls_file = "api_calls.txt"
-    discovered_urls_file = "discovered_urls.txt"
+    api_calls_file = "{outputs}/recon/api_calls.txt"
+    discovered_urls_file = "{outputs}/recon/discovered_urls.txt"
 
     # Create a URL queue for processing URLs
     url_queue = asyncio.Queue()
@@ -320,7 +324,7 @@ async def main(output_queue):
         await url_queue.put(url)
 
     # Start URL processing tasks
-    url_processors = [asyncio.create_task(process_urls(url_queue, all_api_calls, output_queue, api_calls_file, discovered_urls_file)) for _ in range(5)]
+    url_processors = [asyncio.create_task(process_urls(url_queue, all_api_calls, output_queue)) for _ in range(5)]
 
     # Process subdomains and directories
     while not url_queue.empty() or not all(url_queue.empty() for processor in url_processors):
@@ -330,8 +334,8 @@ async def main(output_queue):
             DirLog = f'{outputs}/recon/{subdomain}dir.log'
             dir_enum_command = f'{tor} feroxbuster --url http://{subdomain} --silent -o {EnumDir} >> {DirLog} 2>&1'
             dir_enum_tasks.append(run_command(dir_enum_command, output_queue=output_queue, log_file=log_file))
-            enum_logs.append(DirLog)
-            discovered_urls.add(f"http://{subdomain}/")
+            enum_logs.append(str(read_file(DirLog)))
+            discovered_urls.add(str(read_file(DirLog)))
 
         # Run directory enumeration tasks concurrently
         await asyncio.gather(*dir_enum_tasks)
