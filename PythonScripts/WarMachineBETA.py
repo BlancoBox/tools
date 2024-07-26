@@ -43,7 +43,7 @@ async def fetch_and_extract_api_calls(url, scope, output_queue):
     return set()
 
 # Run a shell command asynchronously with optional verbose output and queue
-async def run_command(command, timeout=60000, verbose=False, output_queue=None, log_file=None):
+async def run_command(command, timeout=6000, verbose=False, output_queue=None, log_file=None):
     try:
         proc = await asyncio.create_subprocess_shell(
             command,
@@ -108,8 +108,9 @@ def extract_details(output):
         'open_ports': re.compile(r'(\d+)/tcp\s+open'),
         'http_ports': re.compile(r'(\d+)/tcp\s+open\s+http'),
         'https_ports': re.compile(r'(\d+)/tcp\s+open\s+https'),
-        'domain': re.compile(r'Nmap scan report for ([^\s]+)'),
-        'os': re.compile(r'Linux|Windows'),
+        'domain': re.compile(r'Nmap scan report for ([a-zA-Z0-9.-]+\.[a-zA-Z]{2,6})'), # Improved regex for domain names
+        'os': re.compile(r'Service Info: OS: ([^;]+)'), # Improved regex for OS details
+        'os_guess': re.compile(r'Aggressive OS guesses: ([^\n]+)'), # Regex for aggressive OS guesses
         'apache': re.compile(r'Apache'),
         'nginx': re.compile(r'nginx'),
         'sql': re.compile(r'MySQL|PostgreSQL|Microsoft SQL Server|Oracle Database')
@@ -130,10 +131,18 @@ def extract_details(output):
             details[key] = matches[0]
         elif key == 'os' and matches:
             details[key] = matches[0]
+        elif key == 'os_guess' and matches:
+            if details['os']:
+                details['os'] += f"; {matches[0]}"
+            else:
+                details['os'] = matches[0]
         elif key in ['apache', 'nginx', 'sql'] and matches:
             details['services'].update(matches)
         elif matches:
             details[key].update(matches)
+
+    # Debugging: Print extracted details
+    print(f"Extracted details: {details}")
 
     return details
 
@@ -189,7 +198,7 @@ async def update_fingerprint(fingerprint_file, details):
 async def process_urls(url_queue, api_calls_set, output_queue):
     while True:
         url = await url_queue.get()
-        api_calls = await fetch_and_extract_api_calls(url, "vulnnet.thm", output_queue)
+        api_calls = await fetch_and_extract_api_calls(url, url, output_queue)
         api_calls_set.update(api_calls)
         url_queue.task_done()
 
@@ -198,31 +207,35 @@ async def main(output_queue):
     check_root()
 
     # Ensure correct usage
-    if len(sys.argv) != 5:
-        print("Usage: python3 script_name.py <arg1> <arg2> <arg3> <arg4>")
-        print("sudo python3 ~/tools/PythonScripts/WarMachineBETA.py <IP> <user> <EnumLV:0|1|2> (1 = Smaller wordlist) <speed:0|1> (0 = A faster scan 'LOUDER'")
+    if len(sys.argv) != 4:
+        print("Usage: python3 script_name.py <arg1> <arg2> <arg3>")
+        print("sudo python3 ~/tools/PythonScripts/WarMachineBETA.py <IP> <user> <LV:0-5'1,3,5 faster scans higher number deeper enumeration'> (1 = Smaller wordlist) <speed:0|1> (0 = A faster scan 'LOUDER'")
         print("Example:")
-        print("sudo python3 ~/tools/PythonScripts/WarMachineBETA.py X.X.X.X blanco 0 0")
+        print("sudo python3 ~/tools/PythonScripts/WarMachineBETA.py X.X.X.X blanco 0")
         sys.exit(1)
 
-    IP, user, EnumLV, speed = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
+    IP, user, LV,  = sys.argv[1], sys.argv[2], int(sys.argv[3])
     
-    # Set sublist and dirlist based on enumeration level
-    if EnumLV == 0:
-        sublist, dirlist = ('/usr/share/seclists/Discovery/DNS/subdomains-top1million-5000.txt', '/usr/share/seclists/Discovery/Web-Content/directory-list-2.3-small.txt')
-    elif EnumLV == 1:
-        sublist, dirlist = ('/usr/share/seclists/Discovery/DNS/subdomains-top1million-20000.txt', '/usr/share/seclists/Discovery/Web-Content/directory-list-2.3-medium.txt')
-    elif EnumLV == 2:
-        sublist, dirlist = ('/usr/share/seclists/Discovery/DNS/subdomains-top1million-110000.txt', '/usr/share/seclists/Discovery/Web-Content/directory-list-2.3-big.txt')
+    # Set Speed, sublist and dirlist based on enumeration level
+    if LV == 0:
+        sublist, dirlist, speed_option = ('/usr/share/seclists/Discovery/DNS/subdomains-top1million-5000.txt', '/usr/share/seclists/Discovery/Web-Content/directory-list-2.3-small.txt', '--min-rate 1000 -T2')
+    elif LV == 1:
+        sublist, dirlist, speed_option = ('/usr/share/seclists/Discovery/DNS/subdomains-top1million-5000.txt', '/usr/share/seclists/Discovery/Web-Content/directory-list-2.3-small.txt', '--min-rate 6000 -T4')    
+    elif LV == 2:
+        sublist, dirlist, speed_option = ('/usr/share/seclists/Discovery/DNS/subdomains-top1million-20000.txt', '/usr/share/seclists/Discovery/Web-Content/directory-list-2.3-medium.txt', '--min-rate 1000 -T2')
+    elif LV == 3:
+        sublist, dirlist, speed_option = ('/usr/share/seclists/Discovery/DNS/subdomains-top1million-20000.txt', '/usr/share/seclists/Discovery/Web-Content/directory-list-2.3-medium.txt', '--min-rate 6000 -T4')
+    elif LV == 4:
+        sublist, dirlist, speed_option = ('/usr/share/seclists/Discovery/DNS/subdomains-top1million-110000.txt', '/usr/share/seclists/Discovery/Web-Content/directory-list-2.3-big.txt', '--min-rate 1000 -T2')
+    elif LV == 5:
+        sublist, dirlist, speed_option = ('/usr/share/seclists/Discovery/DNS/subdomains-top1million-110000.txt', '/usr/share/seclists/Discovery/Web-Content/directory-list-2.3-big.txt', '--min-rate 6000 -T4')
     else:
         raise ValueError("Invalid value for EnumLV")
 
     print(f"Sublist: {sublist}")
     print(f"Dirlist: {dirlist}")
 
-    # Set speed options
-    speed_option = ('--min-rate 5000 -T4') if speed == 0 else ('--max-rate 1000 -T2')
-    
+       
     # Check for web proxy and Tor
     webproxy, ffuf2burp = '', '-replay-proxy http://127.0.0.1:8080' if await check_webproxy() else ''
     tor = 'proxychains' if await check_tor(IP) else ''
@@ -260,7 +273,6 @@ async def main(output_queue):
         f"{tor} sudo nmap {speed_option} {webproxy} -vvv --script=vuln {IP} -oA {outputs}/scan/Nmap/vuln"
     ]
 
-    print(f"Running all commands in fingerprint concurrently...")
 
     details = {
         'tor': tor,
@@ -286,6 +298,7 @@ async def main(output_queue):
             continue
         await output_queue.put(f"Output: {output}")
         scan_details = extract_details(output)
+        print(f"Extracted scan details: {scan_details}")  # Debug statement
         details['open_ports'].update(scan_details['open_ports'])
         details['http_ports'].update(scan_details['http_ports'])
         details['https_ports'].update(scan_details['https_ports'])
@@ -315,8 +328,8 @@ async def main(output_queue):
     directories_and_params = []
     enum_logs = [SubLog]
     all_api_calls = set()
-    api_calls_file = "{outputs}/recon/api_calls.txt"
-    discovered_urls_file = "{outputs}/recon/discovered_urls.txt"
+    api_calls_file = f"{outputs}/recon/api_calls.txt"
+    discovered_urls_file = f"{outputs}/recon/discovered_urls.txt"
 
     # Create a URL queue for processing URLs
     url_queue = asyncio.Queue()
@@ -332,10 +345,17 @@ async def main(output_queue):
         for subdomain in subdomains:
             EnumDir = f'{outputs}/recon/{subdomain}dir.txt'
             DirLog = f'{outputs}/recon/{subdomain}dir.log'
-            dir_enum_command = f'{tor} feroxbuster --url http://{subdomain} --silent -o {EnumDir} >> {DirLog} 2>&1'
-            dir_enum_tasks.append(run_command(dir_enum_command, output_queue=output_queue, log_file=log_file))
-            enum_logs.append(str(read_file(DirLog)))
-            discovered_urls.add(str(read_file(DirLog)))
+            dir_enum_command = [
+                f'{tor} feroxbuster --url http://{subdomain} --silent -o {EnumDir} >> {DirLog} 2>&1',
+                f'sudo cat {DirLog} >> {outputs}/recon/URLs.log'
+                ]
+            dir_enum_tasks.extend([run_command(command, output_queue=output_queue, log_file=log_file) for command in dir_enum_command])
+            # Check if the directory log file exists before trying to read it
+            if os.path.exists(DirLog):
+                enum_logs.append(str(await read_file(DirLog)))
+                discovered_urls.add(str(await read_file(DirLog)))
+            else:
+                print(f"{DirLog} not found, skipping directory extraction for {subdomain}.")
 
         # Run directory enumeration tasks concurrently
         await asyncio.gather(*dir_enum_tasks)
@@ -344,7 +364,7 @@ async def main(output_queue):
         new_subdomains = set()
         for subdomain in subdomains:
             try:
-                async with aiofiles.open(f"{subdomain}feroxdir.log", "r") as log_file:
+                async with aiofiles.open(f"{outputs}/recon/URLs.log", "r") as log_file:
                     async for line in log_file:
                         if "Adding a new job to the queue:" in line:
                             found_url = line.split("Adding a new job to the queue: ")[1].strip()
@@ -370,6 +390,10 @@ async def main(output_queue):
     async with aiofiles.open("enum_logs.txt", "w") as file:
         for log in enum_logs:
             await file.write(f"{log}\n")
+
+    # Create ThankYou.txt and exit
+    async with aiofiles.open("ThankYou.txt", "w") as file:
+        await file.write("Thank you for using WarMachine by Blanco\n")
 
 # Display output using curses
 async def display_output(stdscr, output_queue, fingerprint_file):
