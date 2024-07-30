@@ -18,11 +18,19 @@ import curses
 import time
 
 # Function to make HTTP requests and fetch content
-def fetch_content(url):
+def fetch_content(url, retries=3):
     try:
         response = requests.get(url)
         response.raise_for_status()
         return response.text
+    except requests.exceptions.HTTPError as http_err:
+        if 500 <= response.status_code < 600 and retries > 0:
+            print(f"Error fetching {url}: {response.status_code} {response.reason}, retrying...")
+            time.sleep(2)  # Adding delay before retry
+            return fetch_content(url, retries - 1)
+        else:
+            print(f"Error fetching {url}: {response.status_code} {response.reason}")
+            return None
     except requests.exceptions.RequestException as e:
         print(f"Error fetching {url}: {e}")
         return None
@@ -360,14 +368,14 @@ async def main(output_queue):
                             await inject_queue.put(url)
                             
                         # Attack injection points
+                        inject_tasks = []
                         while not inject_queue.empty():
-                            
-                            inject_tasks = []
-                            for AttackPoint in inject_urls:
-                                inject_command = f'sqlmap -u {AttackPoint} --batch --dbs > {outputs}/attacks/sqlmap_output.log 2>&1'
-                                inject_tasks.extend([run_command(inject_command, output_queue=output_queue, log_file=log_file)])
-            
-            
+                            AttackPoint = await inject_queue.get()
+                            inject_command = f'sqlmap -u {AttackPoint} --batch --dbs > {outputs}/attacks/sqlmap_output.log 2>&1'
+                            inject_tasks.append(run_command(inject_command, output_queue=output_queue, log_file=log_file))
+                        
+                        # Run injection tasks concurrently
+                        await asyncio.gather(*inject_tasks)
 
         # Run directory enumeration tasks concurrently
         await asyncio.gather(*dir_enum_tasks)
