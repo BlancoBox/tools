@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/home/blanco/.local/share/pipx/venvs/bane/bin/python
 # -*- coding: utf-8 -*-
 """
 Created on Sun Jul 28 18:56:47 2024
@@ -9,6 +9,7 @@ Created on Sun Jul 28 18:56:47 2024
 import os
 import sys
 import re
+import string
 import json
 import random
 import curses
@@ -56,6 +57,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 PUSHOVER_USER_KEY = 'u6qoy72x32yvgdcbedhihk7vj59wgn'  # Replace with your Pushover User Key
 PUSHOVER_API_TOKEN = 'aokbkm4rcgcnq6iavfmbj1qdgb7k74'  # Replace with your Pushover API Token
 PUSHOVER_SOUNDS = {
+    'scancomplete': 'ScanComplete',
     'scanning': 'Scanning',
     'hacked': 'Hacked',
     'dead': 'Dead'
@@ -298,6 +300,22 @@ def clean_url_log(file_path):
     except Exception as e:
         logging.debug(f"An unexpected error occurred: {e}")
 
+
+async def generate_random_string(length=10):
+    """
+    Generate a random string of specified length.
+    The string contains uppercase letters, lowercase letters, and digits.
+
+    :param length: Length of the random string to be generated (default is 10)
+    :return: A randomly generated string
+    """
+    if not isinstance(length, int) or length <= 0:
+        raise ValueError("Length must be a positive integer.")
+
+    characters = string.ascii_letters + string.digits  # All letters (uppercase and lowercase) and digits
+    random_string = ''.join(random.choice(characters) for _ in range(length))
+    return random_string
+
 def extract_urls(IP, input_file, output_file):
     try:
         # Read the JSON data from the input file
@@ -333,15 +351,6 @@ async def read_file(file_path):
         content = await file.read()
     return content
 
-def fix_urls(urls, scheme="http"):
-    fixed_urls = []
-    for url in urls:
-        # Ensure URL has correct scheme
-        url = re.sub(r'^https?://', '', url)
-        url = f"{scheme}://{url}"
-        fixed_urls.append(url)
-    return fixed_urls
-
 async def send_request(client, url):
     try:
         response = await client.get(url, follow_redirects=True)
@@ -353,6 +362,7 @@ async def send_request(client, url):
         return url, None
 
 async def categorize_and_save(url_status_map, outputs):
+    rstrings = await generate_random_string(12)
     files = {'200': [], '300': [], '400': [], '500': []}
     for url, status_code in url_status_map.items():
         if status_code:
@@ -364,10 +374,9 @@ async def categorize_and_save(url_status_map, outputs):
                 files['400'].append(url)
             elif 500 <= status_code < 600:
                 files['500'].append(url)
-
     for category, urls in files.items():
         if urls:
-            async with aiofiles.open(f"{outputs}/recon/{category}.txt", 'a') as file:
+            async with aiofiles.open(f"{outputs}/recon/{category}_{rstrings}.txt", 'w') as file:
                 for url in urls:
                     await file.write(f"{url}\n")
 
@@ -399,17 +408,28 @@ async def read_urls_from_file(filepath):
         return []
 
 
-
 # Define an asyncio function to get IP from ping
 async def get_ip_from_ping(domain):
     try:
-        ping_output = subprocess.check_output(["ping", "-c", "1", domain], universal_newlines=True)
-        ip_address = ping_output.split('(')[1].split(')')[0]
-        logging.info(f"Resolved IP from ping: {ip_address}")
-        return ip_address
+        # Use regex to remove the port if present
+        match = re.match(r"^(.*?):(\d+)$", domain)
+        if match:
+            ip_address = match.group(1)
+        else:
+            ip_address = domain
+
+        # Run the ping command without the port
+        ping_output = subprocess.check_output(["ping", "-c", "1", ip_address], universal_newlines=True)
+
+        # Extract IP address from ping output
+        ip_address_from_ping = re.search(r"\(([\d.]+)\)", ping_output).group(1)
+        logging.info(f"Resolved IP from ping: {ip_address_from_ping}")
+        return ip_address_from_ping
+
     except subprocess.CalledProcessError as e:
         logging.info(f"Ping command failed: {e}")
         return None
+
 
 # Define an asyncio function to fetch subdomain size
 async def fetch_subdomain_size(url, IP):
@@ -429,7 +449,7 @@ async def fetch_subdomain_size(url, IP):
     try:
         headers = {"Host": domain}
         response = requests.get(url, headers=headers, allow_redirects=False)
-        if response.status_code == 200 or response.status_code == 302:
+        if response.status_code <= 400  and not response.status_code >= 500:
             content_size = len(response.content)
             logging.info(f"Size of {url}: {content_size} bytes")
             return content_size
@@ -441,11 +461,7 @@ async def fetch_subdomain_size(url, IP):
         return None
 
 
-async def enumeration_stage(http_IP, IP, details, dirlist, sublist, paralist, tor, ffuf2burp, URLLog, speed, outputs, output_queue, log_file, scheme):
-    # Log files for each stage
-    EnumSub = f'{outputs}/recon/SubFfuf.txt'
-    dirCount = 0
-    paramCount = 0
+async def enumeration_stage(http_IP, IP, dirlist, sublist, paralist, tor, ffuf2burp, URLLog, speed, outputs, output_queue, log_file, scheme):
 
 
     domains_found = set()
@@ -456,14 +472,28 @@ async def enumeration_stage(http_IP, IP, details, dirlist, sublist, paralist, to
 
     # Subdomain Enumeration Task
     async def subdomain_enum(http_IP, sublist, speed, outputs, output_queue, log_file):
-        sub_size = await fetch_subdomain_size(f"{scheme}://nonexistent1234.{IP}", IP)
-
-        logging.info('Starting enumeration of subdomains.')
-        subdomain_enum_command = f'sudo ffuf -w {sublist} -u {http_IP} -H "Host: FUZZ.{IP}" {speed} -fs {sub_size} -o {EnumSub} >> {log_file} 2>&1'
-        logging.info(subdomain_enum_command)
-        await run_command(subdomain_enum_command, output_queue=output_queue, log_file=log_file)
-
+        # Check if http_IP is an IP address (IPv4) with optional port
+        ip_match = re.match(r"^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})(:\d+)?$", IP)
         return None
+
+        if ip_match:
+            # Ensure each part of the IP is in the valid range (0-255)
+            if all(0 <= int(part) <= 255 for part in ip_match.groups()[:4]):
+                logging.info(f"No subdomain enumeration performed for IP address: {http_IP}")
+                return None
+            else:
+                # Proceed with the rest of the function if it is not an IP
+                sub_size = await fetch_subdomain_size(f"{scheme}://nonexistent1234.{IP}", IP)
+
+                logging.info('Starting enumeration of subdomains.')
+                subdomain_enum_command = f'sudo ffuf -w {sublist} -u {http_IP} -H "Host: FUZZ.{IP}" {speed} -fs {sub_size} -fl 1 -o {outputs} >> {log_file} 2>&1'
+                logging.info(subdomain_enum_command)
+                await run_command(subdomain_enum_command, output_queue=output_queue, log_file=log_file)
+                logging.info('Sub Enum skipped')
+
+                return None
+
+
 
     # Directory Enumeration Task
     async def directory_enum(domains, dirlist, speed, EnumDir, output_queue, log_file):
@@ -486,12 +516,20 @@ async def enumeration_stage(http_IP, IP, details, dirlist, sublist, paralist, to
     async def parameter_enum(domains, paralist, speed, EnumPara, output_queue, log_file):
         para_enum_tasks = []
         logging.info('Starting enumeration of parameters.')
-        param_size = await fetch_subdomain_size(f"{domains}/?nonexistent1234=test", domains)
+        
+        param_size = await fetch_subdomain_size(f"{domains}/?nonexistent1234=test", IP)
+
+
+        if param_size == None:
+            param_size = '-fl 1'
+        else:
+            param_size =f'-fs {param_size}'
+
 
 
         logging.info(f'Checking parameters for {domains}.')
         # Construct the ffuf command with the custom response length filter and JSON output
-        para_enum_command = f'sudo ffuf -u "{domains}/?FUZZ=test" {speed} -fs {param_size} -w {paralist} -x {ffuf2burp} -o {EnumPara} >> {log_file} 2>&1'
+        para_enum_command = f'sudo ffuf -u "{domains}/?FUZZ=test" -H "Host: {IP}" {speed} -fl 1 -w {paralist} -o {EnumPara} >> {log_file} 2>&1'
         logging.info(para_enum_command)
         # Run ffuf command asynchronously
         para_enum_task = run_command(para_enum_command, output_queue=output_queue, log_file=EnumPara)
@@ -501,157 +539,232 @@ async def enumeration_stage(http_IP, IP, details, dirlist, sublist, paralist, to
         await asyncio.gather(*para_enum_tasks)
         return None
 
+
+    result = await generate_random_string(12)
+
+    # Unique file for each domain's parameter enumeration
+    EnumSub = f'{outputs}/recon/Sub_{result}.txt'
     # Run all enumeration tasks
-    await subdomain_enum(http_IP, sublist, speed, outputs, output_queue, log_file)
-    # Fetch subdomains and apply scheme
-    extract_urls(IP, EnumSub, URLLog)
-    urls = load_payloads(URLLog)
-
-    for url in urls:
-        EnumDir = f'{outputs}/recon/{dirCount}_feroxdir.txt'
-        await directory_enum(url, dirlist, speed, EnumDir, output_queue, log_file)
-        dirCount = dirCount + 1
+    if await subdomain_enum(http_IP, sublist, speed, EnumSub, output_queue, log_file) is None:
+        pass
+    else:
+        await subdomain_enum(http_IP, sublist, speed, EnumSub, output_queue, log_file)
+        extract_urls(IP, EnumSub, URLLog)
 
 
-    for url in urls:
-        # Unique file for each domain's parameter enumeration
-        EnumPara = f'{outputs}/recon/inject_{paramCount}.txt'
-        await parameter_enum(url, paralist, speed, EnumPara, output_queue, log_file)
-        extract_urls(IP, EnumPara, URLLog)
-        paramCount = paramCount + 1
+    EnumDir = f'{outputs}/recon/{result}_feroxdir.txt'
+    await directory_enum(http_IP, dirlist, speed, EnumDir, output_queue, log_file)
+
+
+    # Unique file for each domain's parameter enumeration
+    EnumPara = f'{outputs}/recon/inject_{result}.txt'
+    await parameter_enum(http_IP, paralist, speed, EnumPara, output_queue, log_file)
+    extract_urls(IP, EnumPara, URLLog)
 
 
     logging.info('Enumeration stage complete.')
 
+
+def extract_and_log_ips(input_file, output_file):
+    try:
+        # Check if the input file exists
+        logging.info(f"Checking if the input file '{input_file}' exists...")
+        if not os.path.exists(input_file):
+            # Raise an error if the input file does not exist
+            raise FileNotFoundError(f"The specified file '{input_file}' does not exist.")
+
+        # Regex pattern to match IP addresses and ports
+        # The pattern matches four groups of 1-3 digits separated by dots, followed by a colon and 1-5 digits
+        logging.info("Compiling regex pattern for IP and port extraction...")
+        ip_port_pattern = re.compile(r'((?:\d{1,3}\.){3}\d{1,3}):(\d{1,5})')
+
+        target_urls = []
+
+        # Read the file and extract all matching IPs and Ports
+        logging.info(f"Opening input file '{input_file}' for reading...")
+        with open(input_file, 'r') as file:
+            for line_number, line in enumerate(file, 1):
+                # Find all matches in the current line
+                logging.info(f"Processing line {line_number}: {line.strip()}")
+                matches = ip_port_pattern.findall(line)
+                for match in matches:
+                    ip, port = match
+                    # Append the formatted IP:Port to the target_urls list
+                    formatted_url = f"{ip}:{port}"
+                    logging.info(f"Found IP and port: {formatted_url}")
+                    target_urls.append(formatted_url)
+
+        # Write all formatted target URLs to the log file
+        logging.info(f"Opening output file '{output_file}' for writing...")
+        with open(output_file, 'w') as log_file:
+            for url in target_urls:
+                # Write each URL to the output file
+                logging.info(f"Writing URL to log file: {url}")
+                log_file.write(f"{url}\n")
+
+        # Print a success message indicating how many URLs were logged
+        logging.info(f"Successfully logged {len(target_urls)} URLs to '{output_file}'.")
+
+    # Handle the case where the input file is not found
+    except FileNotFoundError as fnf_error:
+        logging.debug(fnf_error)
+    # Handle any other unexpected exceptions
+    except Exception as e:
+        logging.debug(f"An unexpected error occurred: {e}")
+
+
+
 # Function to initialize the details dictionary
 def initialize_details(tor, webproxy, ffuf2burp, IP, http_IP):
+    # Initialize a dictionary to store scan details
     details = {
-        'tor': tor,
-        'webproxy': webproxy,
-        'ffuf2burp': ffuf2burp,
-        'IP': IP,
-        'open_ports': set(),
-        'http_ports': set(),
-        'https_ports': set(),
-        'domain_name': None,
-        'os_details': None,
-        'services': set(),
-        'targets_string': http_IP
+        'tor': tor,  # Tor proxy details
+        'webproxy': webproxy,  # Web proxy details
+        'ffuf2burp': ffuf2burp,  # Ffuf to Burp details
+        'IP': IP,  # Target IP address
+        'open_ports': set(),  # Set to store open ports discovered during scanning
+        'http_ports': set(),  # Set to store HTTP ports discovered during scanning
+        'https_ports': set(),  # Set to store HTTPS ports discovered during scanning
+        'freeciv_ports': set(),  # Set to track Freeciv service ports
+        'domain_name': None,  # Domain name of the target (if available)
+        'os_details': None,  # Operating system details of the target (if available)
+        'services': set(),  # Set to store detected services (e.g., Apache, MySQL)
+        'targets_string': http_IP  # String representation of target IPs for fingerprinting
     }
+    logging.debug(f"Initialized details: {details}")  # Debug log for initialized details
     return details
 
 
 # Extract details from command output using regular expressions
 def extract_details(output):
+    # Define regular expression patterns to extract relevant information from the command output
     patterns = {
-        'open_ports': re.compile(r'(\d+)/tcp\s+open'),
-        'http_ports': re.compile(r'(\d+)/tcp\s+open\s+http'),
-        'https_ports': re.compile(r'(\d+)/tcp\s+open\s+https'),
-        'domain': re.compile(r'Nmap scan report for ([a-zA-Z0-9.-]+\.[a-zA-Z]{2,6})'), # Improved regex for domain names
-        'os': re.compile(r'Service Info: OS: ([^;]+)'), # Improved regex for OS details
-        'os_guess': re.compile(r'Aggressive OS guesses: ([^\n]+)'), # Regex for aggressive OS guesses
-        'apache': re.compile(r'Apache'),
-        'nginx': re.compile(r'nginx'),
-        'sql': re.compile(r'MySQL|PostgreSQL|Microsoft SQL Server|Oracle Database')
+        'open_ports': re.compile(r'(\d+)/tcp\s+open'),  # Pattern to find open ports in the output
+        'http_ports': re.compile(r'(\d+)/tcp\s+open\s+http'),  # Pattern to find HTTP ports
+        'https_ports': re.compile(r'(\d+)/tcp\s+open\s+https'),  # Pattern to find HTTPS ports
+        'freeciv_ports': re.compile(r'(\d+)/tcp\s+open\s+freeciv'),  # Pattern to find Freeciv ports
+        'domain': re.compile(r'Nmap scan report for ([a-zA-Z0-9.-]+\.[a-zA-Z]{2,6})'),  # Pattern to extract the domain name
+        'os': re.compile(r'Service Info: OS: ([^;]+)'),  # Pattern to extract OS details from service information
+        'os_guess': re.compile(r'Aggressive OS guesses: ([^\n]+)'),  # Pattern to extract aggressive OS guesses
+        'freeciv': re.compile(r'freeciv'),  # Pattern to detect the presence of Freeciv service
+        'apache': re.compile(r'Apache'),  # Pattern to detect Apache service
+        'nginx': re.compile(r'nginx'),  # Pattern to detect Nginx service
+        'sql': re.compile(r'MySQL|PostgreSQL|Microsoft SQL Server|Oracle Database')  # Pattern to detect SQL-related services
     }
 
+    # Initialize a dictionary to store the extracted details
     details = {
         'open_ports': set(),
         'http_ports': set(),
         'https_ports': set(),
-        'domain': None,
-        'os': None,
-        'services': set()
+        'freeciv_ports': set(),  # Added freeciv_ports to store freeciv related ports
+        'domain': None,  # Initialize domain as None until extracted
+        'os': None,  # Initialize OS details as None until extracted
+        'services': set()  # Initialize set to store detected services
     }
 
+    # Iterate through the patterns and extract matches from the command output
     for key, pattern in patterns.items():
-        matches = pattern.findall(output)
+        matches = pattern.findall(output)  # Find all matches for the current pattern in the output
+        logging.debug(f"Pattern '{key}' found matches: {matches}")  # Debug log for pattern matches
         if key == 'domain' and matches:
-            details[key] = matches[0]
+            details[key] = matches[0]  # Store the first domain match found in the output
         elif key == 'os' and matches:
-            details[key] = matches[0]
+            details[key] = matches[0]  # Store the OS details from the output
         elif key == 'os_guess' and matches:
+            # Append OS guesses if available, otherwise initialize the OS details with the first guess
             if details['os']:
                 details['os'] += f"; {matches[0]}"
             else:
                 details['os'] = matches[0]
-        elif key in ['apache', 'nginx', 'sql'] and matches:
+        elif key in ['apache', 'nginx', 'sql', 'freeciv'] and matches:
+            # Add the matched services (e.g., Apache, Nginx) to the services set
             details['services'].update(matches)
         elif matches:
+            # Update the set with the matched ports (open, HTTP, HTTPS, Freeciv)
             details[key].update(matches)
 
-    # Debugging: Print extracted details
+    # Debugging: Log extracted details for verification
     logging.info(f"Extracted details: {details}")
 
     return details
 
-# Add Threading (Optional)
-# Function to wrap I/O bound tasks into threads for performance gains
-def run_in_thread_pool(func, *args):
-    with ThreadPoolExecutor() as executor:
-        return asyncio.get_event_loop().run_in_executor(executor, func, *args)
-
-
-# Example of how to use `run_in_thread_pool` if blocking I/O tasks are present
-# You can replace `run_command` with `run_in_thread_pool(run_command, ...)` for blocking subprocesses.
 
 # Update fingerprint file
 async def update_fingerprint(fingerprint_file, details):
+    # Debug log before writing to fingerprint file to trace details
+    logging.debug(f"Updating fingerprint file '{fingerprint_file}' with details: {details}")
+    # Open the fingerprint file asynchronously for writing
     async with aiofiles.open(fingerprint_file, "w") as f:
-        await f.write(f"Proxys: {details['tor']}, {details['webproxy']}, {details['ffuf2burp']} \n")
-        await f.write(f"Domain: {details['domain_name']}\n")
-        await f.write(f"Domain to IP: {details['IP']}\n")
-        await f.write(f"All Open Ports: {list(details['open_ports'])}\n")
-        await f.write(f"HTTP Ports: {list(details['http_ports'])}\n")
-        await f.write(f"HTTPS Ports: {list(details['https_ports'])}\n")
-        await f.write(f"Targets: {details['targets_string']}\n")
-        await f.write(f"OS Details: {details['os_details']}\n")
-        await f.write(f"Services: {', '.join(details['services'])}\n")
+        # Write the various details to the fingerprint file
+        await f.write(f"Proxys: {details['tor']}, {details['webproxy']}, {details['ffuf2burp']} \n")  # Write proxy details
+        await f.write(f"Domain: {details['domain_name']}\n")  # Write domain name if available
+        await f.write(f"Domain to IP: {details['IP']}\n")  # Write IP address of the domain
+        await f.write(f"All Open Ports: {list(details['open_ports'])}\n")  # Write all open ports
+        await f.write(f"HTTP Ports: {list(details['http_ports'])}\n")  # Write HTTP ports
+        await f.write(f"HTTPS Ports: {list(details['https_ports'])}\n")  # Write HTTPS ports
+        await f.write(f"Targets: {details['targets_string']}\n")  # Write target string details
+        await f.write(f"OS Details: {details['os_details']}\n")  # Write OS details if available
+        await f.write(f"Services: {', '.join(details['services'])}\n")  # Write detected services
+    logging.info(f"Fingerprint file '{fingerprint_file}' updated successfully.")  # Log success message
+
 
 # Define the fingerprint_stage function BEFORE main
 async def fingerprint_stage(IP, tor, webproxy, ffuf2burp, speed_option, outputs, details, output_queue, log_file):
-    # Define fingerprint commands
+    # Define fingerprint commands to run on the target system using different tools
     fingerprint_commands = [
-        f"{tor} ping -c 2 {IP}",
-        f"{tor} sudo rustscan -t 1000 -b 1000 --ulimit 1000 -r 0-65535 -a {IP} | sudo tee rust.txt",
-        f"{tor} sudo nmap -p- {speed_option} {webproxy} -sC -vvv {IP} -oA {outputs}/scan/Nmap/SC",
-        f"{tor} sudo nmap -p- {speed_option} {webproxy} -sV -vvv {IP} -oA {outputs}/scan/Nmap/SV",
-        f"{tor} sudo nmap -p- {speed_option} {webproxy} -vvv -O {IP} -oA {outputs}/scan/Nmap/OS",
-        f"{tor} sudo nmap -p- {speed_option} {webproxy} -vvv --script=vuln {IP} -oA {outputs}/scan/Nmap/vuln",
-        f"{tor} sudo nmap -f -D RND:10 --spoof-mac 00:11:22:33:44:55 -g 53 --mtu 16 --randomize-hosts {speed_option} {webproxy} -sS -vvv -O {IP} -oA {outputs}/scan/Nmap/OS",
-        f"{tor} sudo nmap -f -D RND:10 --spoof-mac 00:11:22:33:44:55 -g 53 --mtu 16 --randomize-hosts {speed_option} {webproxy} -vvv --script=vuln {IP} -oA {outputs}/scan/Nmap/vuln",
-        f"{tor} sudo nmap -sS -f -D RND:10 --spoof-mac 00:11:22:33:44:55 -g 53 --mtu 16 --randomize-hosts --badsum -Pn {speed_option} {webproxy} -vvv  {IP} -oA {outputs}/scan/Nmap/hush",
-        f"{tor} sudo nmap -p 1-65535 -f -D RND:10 --spoof-mac 00:11:22:33:44:55 -g 53 --mtu 16 --randomize-hosts {speed_option} {webproxy} -sA -vvv  {IP} -oA {outputs}/scan/Nmap/hushgen",
-        f"{tor} sudo nmap -f -D RND:10 --spoof-mac 00:11:22:33:44:55 -g 53 --mtu 16 --randomize-hosts {speed_option} {webproxy} -sS -vvv -O {IP} -oA {outputs}/scan/Nmap/hushOS",
-        f"{tor} sudo nmap -f -D RND:10 --spoof-mac 00:11:22:33:44:55 -g 53 --mtu 16 --randomize-hosts {speed_option} {webproxy} -vvv --script=vuln {IP} -oA {outputs}/scan/Nmap/hushvuln"
+        f"{tor} ping -c 2 {IP}",  # Ping command to check reachability
+        f"{tor} sudo rustscan -t 1000 -b 1000 --ulimit 1000 -r 0-65535 -a {IP} | sudo tee rust.txt",  # Rustscan to quickly identify open ports
+        f"{tor} sudo nmap -p- {speed_option} {webproxy} -A  {IP} -vvv -oA {outputs}/scan/Nmap/A",
+        f"{tor} sudo nmap -p- {speed_option} {webproxy} -sC  {IP} -vvv -oA {outputs}/scan/Nmap/SC",  # Nmap scan with default scripts
+        f"{tor} sudo nmap -p- {speed_option} {webproxy} -sV  {IP} -vvv -oA {outputs}/scan/Nmap/SV",  # Nmap scan for version detection of services
+        f"{tor} sudo nmap -p- {speed_option} {webproxy}  -O {IP} -vvv -oA {outputs}/scan/Nmap/OS",  # Nmap scan for OS detection
+        f"{tor} sudo nmap -p- {speed_option} {webproxy}  --script=vuln {IP} -vvv -oA {outputs}/scan/Nmap/vuln",  # Nmap vulnerability scan to identify potential weaknesses
+        f"{tor} sudo nmap -f -D RND:10 --spoof-mac 00:11:22:33:44:55 -g 53 --mtu 16 --randomize-hosts {speed_option} {webproxy} -sS -vvv -O {IP} -oA {outputs}/scan/Nmap/OS",  # Nmap scan with spoofing and OS detection
+        f"{tor} sudo nmap -f -D RND:10 --spoof-mac 00:11:22:33:44:55 -g 53 --mtu 16 --randomize-hosts {speed_option} {webproxy} -vvv --script=vuln {IP} -oA {outputs}/scan/Nmap/vuln",  # Nmap vulnerability scan with spoofing
+        f"{tor} sudo nmap -sS -f -D RND:10 --spoof-mac 00:11:22:33:44:55 -g 53 --mtu 16 --randomize-hosts --badsum -Pn {speed_option} {webproxy} -vvv  {IP} -oA {outputs}/scan/Nmap/hush",  # Nmap stealth scan with bad checksum
+        f"{tor} sudo nmap -p 1-65535 -f -D RND:10 --spoof-mac 00:11:22:33:44:55 -g 53 --mtu 16 --randomize-hosts {speed_option} {webproxy} -sA -vvv  {IP} -oA {outputs}/scan/Nmap/hushgen",  # Nmap ACK scan with spoofing
+        f"{tor} sudo nmap -f -D RND:10 --spoof-mac 00:11:22:33:44:55 -g 53 --mtu 16 --randomize-hosts {speed_option} {webproxy} -sS -vvv -O {IP} -oA {outputs}/scan/Nmap/hushOS",  # Nmap stealth scan with OS detection
+        f"{tor} sudo nmap -f -D RND:10 --spoof-mac 00:11:22:33:44:55 -g 53 --mtu 16 --randomize-hosts {speed_option} {webproxy} -vvv --script=vuln {IP} -oA {outputs}/scan/Nmap/hushvuln"  # Nmap vulnerability scan with spoofing
     ]
 
-
     # Run the fingerprint commands asynchronously
+    logging.info(f"Starting fingerprint commands: {fingerprint_commands}")  # Debug log for fingerprint commands
     fingerprint_tasks = [run_command(command, output_queue=output_queue, log_file=log_file) for command in fingerprint_commands]
-    results = await asyncio.gather(*fingerprint_tasks)
+    results = await asyncio.gather(*fingerprint_tasks)  # Run all fingerprint tasks concurrently
 
-    # Process the results
+    # Process the results of the fingerprint commands
     for output, error in results:
         if error:
+            # Log any errors encountered during the scan
             await output_queue.put(f"Error: {error}")
+            logging.error(f"Error encountered: {error}")  # Error log for command error
             continue
+        # Log the output of each command
         await output_queue.put(f"Output: {output}")
+        logging.debug(f"Command output: {output}")  # Debug log for command output
+        # Extract details from the command output
         scan_details = extract_details(output)
+        # Update the details dictionary with extracted information
         details['open_ports'].update(scan_details['open_ports'])
         details['http_ports'].update(scan_details['http_ports'])
         details['https_ports'].update(scan_details['https_ports'])
+        details['freeciv_ports'].update(scan_details['freeciv_ports'])  # Update freeciv_ports from scan details
         if scan_details['domain']:
             details['domain_name'] = scan_details['domain']
         if scan_details['os']:
             details['os_details'] = scan_details['os']
         details['services'].update(scan_details['services'])
 
+        # Log updated details for debugging
+        logging.debug(f"Updated details after processing output: {details}")
+
         # Update fingerprint file after each scan
-        targets = [f"{IP}:{port}" for port in details['http_ports'] | details['https_ports']]
-        details['targets_string'] = ", ".join(targets)
-        fingerprint_file = os.path.join(outputs, "fingerprint.txt")
-        await update_fingerprint(fingerprint_file, details)
+        targets = [f"{IP}:{port}" for port in details['open_ports']]  # Include freeciv_ports in target list
+        details['targets_string'] = ", ".join(targets)  # Update the target string with new ports
+        fingerprint_file = os.path.join(outputs, "fingerprint.txt")  # Path to the fingerprint file
+        await update_fingerprint(fingerprint_file, details)  # Update the fingerprint file with the latest details
+
 
 # Extract CSRF token from the login page
 async def get_csrf_token(session, login_page_url):
@@ -1319,13 +1432,15 @@ async def injection_attacks(url_list, xss_payloads_file, sqli_payloads_file, cmd
         'Template Injection': template_injection_payloads
     }
 
+    rstrings = await generate_random_string(12)
+
     for url in urls:
 
         #SSTIresult = SSTI_Scanner.scan(url, save_to_file=f'{outputs}/attacks/SSTI_Success.txt', headers=await get_spoofed_headers(), http_proxies=proxies)
         SSRFresult = SSRF_Scanner.scan(url, headers=await get_spoofed_headers(), http_proxies=proxies)
         XSSresult = XSS_Scanner.scan(url, headers=await get_spoofed_headers(), http_proxies=proxies)
         #Perform the RCE scan
-        RCEresult = RCE_Scanner.scan(url, save_to_file=f'{outputs}/attacks/RCE_Success.txt', headers=await get_spoofed_headers(), http_proxies=proxies)
+        RCEresult = RCE_Scanner.scan(url, save_to_file=f'{outputs}/attacks/RCE_Success_{rstrings}.txt', headers=await get_spoofed_headers(), http_proxies=proxies)
         #Perform the Path Traversal vulnerability scan
         Path_Traversalresults = Path_Traversal_Scanner.scan(url, headers=await get_spoofed_headers(), http_proxies=proxies)
         #Perform a scan for file upload vulnerabilities
@@ -1354,7 +1469,7 @@ async def injection_attacks(url_list, xss_payloads_file, sqli_payloads_file, cmd
             logging.info("Method: " + result["method"])
             logging.info("Vulnerable Fields: " + str(result["vulnerable"]))
             logging.info("\n")
-            #await send_pushover_notification(message, sound_key='hacked')
+            await send_pushover_notification(message, sound_key='hacked')
             success_detected = True
 
 
@@ -1407,6 +1522,7 @@ async def injection_attacks(url_list, xss_payloads_file, sqli_payloads_file, cmd
 
 async def CMS_scans(url_list, outputs_path):
     urls = load_payloads(url_list)
+    rstrings = await generate_random_string(12)
     for url in urls:
         #Scanning CMS
         Drupal_result = Drupal_Scanner.scan(url, headers=await get_spoofed_headers(), http_proxies=proxies)
@@ -1421,17 +1537,121 @@ async def CMS_scans(url_list, outputs_path):
         logging.info(WordPress_result)
 
         #saving resuls
-        save_result(outputs_path, "scan/Drupal_result.txt", Drupal_result)
-        save_result(outputs_path, "scan/Joomla_result.txt", Joomla_result)
-        save_result(outputs_path, "scan/Magento_result.txt", Magento_result)
-        save_result(outputs_path, "scan/WordPress_result.txt", WordPress_result)
+        save_result(outputs_path, f"scan/Drupal_result_{rstrings}.txt", Drupal_result)
+        save_result(outputs_path, f"scan/Joomla_result._{rstrings}txt", Joomla_result)
+        save_result(outputs_path, f"scan/Magento_result._{rstrings}txt", Magento_result)
+        save_result(outputs_path, f"scan/WordPress_result._{rstrings}txt", WordPress_result)
 
 
     return None
 
+async def target_urls(url_list, details, dirlist, sublist, paralist, tor, ffuf2burp, speed, xss_payloads, sqli_payloads, cmd_injection_payloads, template_injection_payloads, outputs, output_queue, log_file):
+    # Load URLs from file, filter out those starting with '127.0.0.1' to avoid local addresses
+    with open(url_list, 'r') as file:
+        url_list = [url.strip() for url in file.readlines() if not url.startswith("127.0.0.1")]
+
+    # Iterate over each URL and attempt connections
+    for url in url_list:
+        # Prepare HTTP and HTTPS versions of the URL
+        modified_url_http = f"http://{url}"
+        modified_url_https = f"https://{url}"
+        connection_successful = False
+        successful_urls = []
+        connection_successful = False
+        scheme = None
+        url_http = None
+
+        # Attempt HTTP connection without SSL verification
+        try:
+            logging.info(f"Attempting to connect to {modified_url_http} without SSL")
+            # Create a connector that ignores SSL to avoid certification validation issues for HTTP
+            connector = aiohttp.TCPConnector(ssl=False)
+            # Start an HTTP session with the created connector
+            async with aiohttp.ClientSession(connector=connector) as session:
+                # Attempt to GET the modified URL through an HTTP proxy
+                async with session.get(modified_url_http, proxy='http://127.0.0.1:8080', allow_redirects=False) as response:
+                    # Only count status code 200 as successful to avoid false positives
+                    if response.status == 200:
+                        logging.info(f"Connection successful to {modified_url_http}")
+                        successful_urls.append(modified_url_http)
+                        connection_successful = True
+                        scheme = 'http'
+                        url_http = modified_url_http
+                        # If a connection was successfully made, proceed to enumeration
+                        if connection_successful:
+                            await enumeration_stage(url_http, url, dirlist, sublist, paralist, tor, ffuf2burp, f"{outputs}/recon/URL.log", speed, outputs, output_queue, log_file, scheme)
+                            await Processes_URLS(f"{outputs}/recon/URL.log", outputs)
+                            logging.info('Processesing URLs')
+                            await asyncio.gather(
+                                injection_attacks(f"{outputs}/recon/URL.log", xss_payloads, sqli_payloads, cmd_injection_payloads, template_injection_payloads, outputs),
+                                CMS_scans(f"{outputs}/recon/URL.log", outputs)
+                            )
+
+                        else:
+                            logging.info(f"Failed to establish a connection to {modified_url_http}")
+                    else:
+                        logging.warning(f"Received non-successful status code {response.status} for {modified_url_http}")
+
+        except aiohttp.ClientConnectorError as e:
+            # Log specific connection errors (e.g., host unreachable)
+            logging.error(f"Connection error without SSL for {modified_url_http}: {e}")
+        except Exception as e:
+            # Log any unexpected errors that might occur
+            logging.error(f"Unexpected error during non-SSL connection attempt for {modified_url_http}: {e}")
+
+        # Attempt HTTPS connection with SSL if HTTP connection fails
+        if not connection_successful:
+            try:
+                logging.info(f"Attempting to connect to {modified_url_https} with SSL")
+                # Create a connector with SSL enabled for HTTPS
+                connector = aiohttp.TCPConnector(ssl=ssl.create_default_context())
+                # Start an HTTPS session with the created connector
+                async with aiohttp.ClientSession(connector=connector) as session:
+                    # Attempt to GET the modified URL through an HTTP proxy
+                    async with session.get(modified_url_https, proxy='http://127.0.0.1:8080', allow_redirects=False) as response:
+                        # Only count status code 200 as successful to avoid false positives
+                        if response.status == 200:
+                            logging.info(f"Connection successful to {modified_url_https}")
+                            successful_urls.append(modified_url_https)
+                            connection_successful = True
+                            scheme = 'https'
+                            url_http = modified_url_https
+                            # If a connection was successfully made, proceed to enumeration
+                            if connection_successful:
+                                await enumeration_stage(url_http, url, dirlist, sublist, paralist, tor, ffuf2burp, f"{outputs}/recon/URL.log", speed, outputs, output_queue, log_file, scheme)
+                                await asyncio.gather(
+                                    injection_attacks(f"{outputs}/recon/URL.log", xss_payloads, sqli_payloads, cmd_injection_payloads, template_injection_payloads, outputs),
+                                    CMS_scans(f"{outputs}/recon/URL.log", outputs)
+                                )
+                                await Processes_URLS(f"{outputs}/recon/URL.log", outputs)
+                                logging.info('Processesing URLs')
+                            else:
+                                logging.info(f"Failed to establish a connection to {modified_url_https}")
+                        else:
+                            logging.warning(f"Received non-successful status code {response.status} for {modified_url_https}")
+
+            except aiohttp.ClientConnectorError as e:
+                # Log specific connection errors for HTTPS
+                logging.error(f"Connection error with SSL for {modified_url_https}: {e}")
+            except ssl.SSLError as e:
+                # Log SSL-specific errors (e.g., certificate verification failed)
+                logging.error(f"SSL error for {modified_url_https}: {e}")
+            except Exception as e:
+                # Log any unexpected errors that might occur during the HTTPS connection attempt
+                logging.error(f"Unexpected error during SSL connection attempt for {modified_url_https}: {e}")
+
+        # Log all successful URLs after completing the iterations
+        logging.info(f"Successful URLs: {successful_urls}")
+
+
+
+
+
+
 # Main asyncio function
 async def main(output_queue):
     prevailing_session = None
+    http_IP = None
 
     try:
         logging.debug("Starting main function.")
@@ -1439,82 +1659,43 @@ async def main(output_queue):
         if len(sys.argv) >= 6:
             IP = sys.argv[1].strip()
             LV = int(sys.argv[2])
+            # Convert LV only if it is a valid integer string
+            try:
+                LV = int(sys.argv[2].strip())
+            except ValueError:
+                logging.error("Invalid LV value provided as command-line argument. Defaulting LV to 1.")
+                LV = 1
             valid_user = sys.argv[3].split(',')
             valid_password = sys.argv[4].split(',')
             attack_server = sys.argv[5].strip()
         else:
             print("Usage: python3 script_name.py <arg1> <arg2> <arg3> <arg4> <arg5>")
             IP = input("URL or IP: ").strip()
-            LV = int(input("0-5: "))
+            LV_input = input("0-5: ").strip()
+            if LV_input.isdigit():
+                LV = int(LV_input)
+            else:
+                logging.error("Invalid LV input from user. Defaulting LV to 1.")
+                LV = 1
             valid_user = input("USER (comma-separated list): ").split(',')
             valid_password = input("PASS (comma-separated list): ").split(',')
             attack_server = input("Attack Server: ").strip()
-
-        modified_url_http = f"http://{IP}"
-        modified_url_https = f"https://{IP}"
-        connection_successful = False
-
-
-        try:
-            logging.info(f"Attempting to connect to {modified_url_http} without SSL")
-            connector = aiohttp.TCPConnector(ssl=False)
-            async with aiohttp.ClientSession(connector=connector) as session:
-                async with session.get(modified_url_http, proxy='http://127.0.0.1:8080', allow_redirects=False) as response:
-                    if response.status == 200:
-                        logging.info(f"Connection successful to {modified_url_http}")
-                        scheme = 'http'
-                        http_IP = modified_url_http
-                        connection_successful = True
-                        prevailing_session = session
-
-        except aiohttp.ClientConnectorError as e:
-            logging.error(f"Connection error without SSL for {IP}: {e}")
-        except Exception as e:
-            logging.error(f"Unexpected error during non-SSL connection attempt for {IP}: {e}")
-
-        if not connection_successful:
-            try:
-                connector = aiohttp.TCPConnector(ssl=ssl.create_default_context())
-                async with aiohttp.ClientSession(connector=connector) as session:
-                    async with session.get(modified_url_https, proxy='http://127.0.0.1:8080', allow_redirects=False) as response:
-                        if response.status == 200:
-                            logging.info(f"Connection successful to {modified_url_https}")
-                            scheme = 'https'
-                            http_IP = modified_url_https
-                            connection_successful = True
-                            prevailing_session = session  # Save session for future use
-
-            except aiohttp.ClientConnectorError as e:
-                logging.error(f"Connection error with SSL for {IP}: {e}")
-                await session.close()  # Close session on failure
-            except Exception as e:
-                logging.error(f"Unexpected error during SSL connection attempt for {IP}: {e}")
-                await session.close()  # Close session on failure
-
-        # Check if no connection was successful
-        if not connection_successful:
-            logging.error(f"All connection attempts failed for {IP}")
-            return
-
-        # Continue with the rest of the script logic using the updated `IP` variable
-        logging.info(f"Updated IP with scheme: {IP}")
-
 
 
 
         # Set Speed, sublist and dirlist based on enumeration level
         if LV == 0:
-            users_list, password_list, xss_payloads, sqli_payloads, cmd_injection_payloads, template_injection_payloads, sublist, dirlist, paralist, speed, speed_option = ('/usr/share/wordlists/seclists/Usernames/users.txt', '/usr/share/wordlists/pass.txt', '/usr/share/wordlists/seclists/Fuzzing/XSS/robot-friendly/XSS-Fuzzing.txt', '/usr/share/wordlists/seclists/Fuzzing/SQLi/quick-SQLi.txt', '/usr/share/wordlists/seclists/Fuzzing/allCOMMANDS.txt', '/usr/share/wordlists/seclists/Fuzzing/allSSTI.txt', '/usr/share/seclists/Discovery/DNS/subdomains-top1million-5000.txt', '/usr/share/seclists/Discovery/Web-Content/directory-list-2.3-small.txt', '/usr/share/wordlists/paramlist/params.txt', '-t 30', '-T2')
+            users_list, password_list, xss_payloads, sqli_payloads, cmd_injection_payloads, template_injection_payloads, sublist, dirlist, paralist, speed, speed_option = ('/usr/share/wordlists/seclists/Usernames/users.txt', '/usr/share/wordlists/pass.txt', '/usr/share/wordlists/seclists/Fuzzing/XSS/robot-friendly/XSS-Fuzzing.txt', '/usr/share/wordlists/seclists/Fuzzing/SQLi/quick-SQLi.txt', '/usr/share/wordlists/seclists/Fuzzing/allCOMMANDS.txt', '/usr/share/wordlists/seclists/Fuzzing/allSSTI.txt', '/usr/share/seclists/Discovery/DNS/subdomains-top1million-5000.txt', '/usr/share/seclists/Discovery/Web-Content/directory-list-2.3-small.txt', '/usr/share/wordlists/paramlist/params.txt', '-t 30', '--max-rate=1000')
         elif LV == 1:
-            users_list, password_list, xss_payloads, sqli_payloads, cmd_injection_payloads, template_injection_payloads, sublist, dirlist, paralist, speed, speed_option = ('/usr/share/wordlists/seclists/Usernames/users.txt', '/usr/share/wordlists/pass.txt', '/usr/share/wordlists/seclists/Fuzzing/XSS/robot-friendly/XSS-Fuzzing.txt', '/usr/share/wordlists/seclists/Fuzzing/SQLi/quick-SQLi.txt', '/usr/share/wordlists/seclists/Fuzzing/allCOMMANDS.txt', '/usr/share/wordlists/seclists/Fuzzing/allSSTI.txt', '/usr/share/seclists/Discovery/DNS/subdomains-top1million-5000.txt', '/usr/share/seclists/Discovery/Web-Content/directory-list-2.3-small.txt','/usr/share/wordlists/paramlist/params.txt', '-t 60', '-T4')
+            users_list, password_list, xss_payloads, sqli_payloads, cmd_injection_payloads, template_injection_payloads, sublist, dirlist, paralist, speed, speed_option = ('/usr/share/wordlists/seclists/Usernames/users.txt', '/usr/share/wordlists/pass.txt', '/usr/share/wordlists/seclists/Fuzzing/XSS/robot-friendly/XSS-Fuzzing.txt', '/usr/share/wordlists/seclists/Fuzzing/SQLi/quick-SQLi.txt', '/usr/share/wordlists/seclists/Fuzzing/allCOMMANDS.txt', '/usr/share/wordlists/seclists/Fuzzing/allSSTI.txt', '/usr/share/seclists/Discovery/DNS/subdomains-top1million-5000.txt', '/usr/share/seclists/Discovery/Web-Content/directory-list-2.3-small.txt','/usr/share/wordlists/paramlist/params.txt', '-t 60', '--min-rate=1000')
         elif LV == 2:
-            users_list, password_list, xss_payloads, sqli_payloads, cmd_injection_payloads, template_injection_payloads, sublist, dirlist, paralist, speed, speed_option = ('/usr/share/wordlists/seclists/Usernames/xato-net-10-million-usernames-dup.txt', '/usr/share/wordlists/seclists/Passwords/xato-net-10-million-passwords.txt', '/usr/share/wordlists/seclists/Fuzzing/XSS/robot-friendly/XSS-Cheat-Sheet-PortSwigger.txt', '/usr/share/wordlists/seclists/Fuzzing/SQLi/Generic-SQLi.txt', '/usr/share/wordlists/seclists/Fuzzing/allCOMMANDS.txt', '/usr/share/wordlists/seclists/Fuzzing/allSSTI.txt', '/usr/share/seclists/Discovery/DNS/subdomains-top1million-20000.txt', '/usr/share/seclists/Discovery/Web-Content/directory-list-2.3-medium.txt', '/usr/share/wordlists/paramlist/params.txt', '-t 30', '-T2')
+            users_list, password_list, xss_payloads, sqli_payloads, cmd_injection_payloads, template_injection_payloads, sublist, dirlist, paralist, speed, speed_option = ('/usr/share/wordlists/seclists/Usernames/xato-net-10-million-usernames-dup.txt', '/usr/share/wordlists/seclists/Passwords/xato-net-10-million-passwords.txt', '/usr/share/wordlists/seclists/Fuzzing/XSS/robot-friendly/XSS-Cheat-Sheet-PortSwigger.txt', '/usr/share/wordlists/seclists/Fuzzing/SQLi/Generic-SQLi.txt', '/usr/share/wordlists/seclists/Fuzzing/allCOMMANDS.txt', '/usr/share/wordlists/seclists/Fuzzing/allSSTI.txt', '/usr/share/seclists/Discovery/DNS/subdomains-top1million-20000.txt', '/usr/share/seclists/Discovery/Web-Content/directory-list-2.3-medium.txt', '/usr/share/wordlists/paramlist/params.txt', '-t 30', '--max-rate=1000')
         elif LV == 3:
-            users_list, password_list, xss_payloads, sqli_payloads, cmd_injection_payloads, template_injection_payloads, sublist, dirlist, paralist, speed, speed_option = ('/usr/share/wordlists/seclists/Usernames/xato-net-10-million-usernames-dup.txt', '/usr/share/wordlists/seclists/Passwords/xato-net-10-million-passwords.txt', '/usr/share/wordlists/seclists/Fuzzing/XSS/robot-friendly/XSS-Cheat-Sheet-PortSwigger.txt', '/usr/share/wordlists/seclists/Fuzzing/SQLi/Generic-SQLi.txt', '/usr/share/wordlists/seclists/Fuzzing/allCOMMANDS.txt', '/usr/share/wordlists/seclists/Fuzzing/allSSTI.txt', '/usr/share/seclists/Discovery/DNS/subdomains-top1million-20000.txt', '/usr/share/seclists/Discovery/Web-Content/directory-list-2.3-medium.txt', '/usr/share/wordlists/paramlist/parameters.txt', '-t 60', '-T4')
+            users_list, password_list, xss_payloads, sqli_payloads, cmd_injection_payloads, template_injection_payloads, sublist, dirlist, paralist, speed, speed_option = ('/usr/share/wordlists/seclists/Usernames/xato-net-10-million-usernames-dup.txt', '/usr/share/wordlists/seclists/Passwords/xato-net-10-million-passwords.txt', '/usr/share/wordlists/seclists/Fuzzing/XSS/robot-friendly/XSS-Cheat-Sheet-PortSwigger.txt', '/usr/share/wordlists/seclists/Fuzzing/SQLi/Generic-SQLi.txt', '/usr/share/wordlists/seclists/Fuzzing/allCOMMANDS.txt', '/usr/share/wordlists/seclists/Fuzzing/allSSTI.txt', '/usr/share/seclists/Discovery/DNS/subdomains-top1million-20000.txt', '/usr/share/seclists/Discovery/Web-Content/directory-list-2.3-medium.txt', '/usr/share/wordlists/paramlist/parameters.txt', '-t 60', '--min-rate=1000')
         elif LV == 4:
-            users_list, password_list, xss_payloads, sqli_payloads, cmd_injection_payloads, template_injection_payloads, sublist, dirlist, paralist, speed, speed_option = ('/usr/share/wordlists/seclists/Usernames/xato-net-10-million-usernames.txt', '/usr/share/wordlists/rockyou.txt', '/usr/share/wordlists/seclists/Fuzzing/XSS/robot-friendly/allXSS.txt', '/usr/share/wordlists/seclists/Fuzzing/SQLi/allSQLI.txt', '/usr/share/wordlists/seclists/Fuzzing/allCOMMANDS.txt', '/usr/share/wordlists/seclists/Fuzzing/allSSTI.txt', '/usr/share/seclists/Discovery/DNS/subdomains-top1million-110000.txt', '/usr/share/seclists/Discovery/Web-Content/directory-list-2.3-big.txt', '/usr/share/wordlists/paramlist/parameters.txt', '-t 30', '-T2')
+            users_list, password_list, xss_payloads, sqli_payloads, cmd_injection_payloads, template_injection_payloads, sublist, dirlist, paralist, speed, speed_option = ('/usr/share/wordlists/seclists/Usernames/xato-net-10-million-usernames.txt', '/usr/share/wordlists/rockyou.txt', '/usr/share/wordlists/seclists/Fuzzing/XSS/robot-friendly/allXSS.txt', '/usr/share/wordlists/seclists/Fuzzing/SQLi/allSQLI.txt', '/usr/share/wordlists/seclists/Fuzzing/allCOMMANDS.txt', '/usr/share/wordlists/seclists/Fuzzing/allSSTI.txt', '/usr/share/seclists/Discovery/DNS/subdomains-top1million-110000.txt', '/usr/share/seclists/Discovery/Web-Content/directory-list-2.3-big.txt', '/usr/share/wordlists/paramlist/parameters.txt', '-t 30', '--max-rate=1000')
         elif LV == 5:
-            users_list, password_list, xss_payloads, sqli_payloads, cmd_injection_payloads, template_injection_payloads, sublist, dirlist, paralist, speed, speed_option = ('/usr/share/wordlists/seclists/Usernames/xato-net-10-million-usernames.txt', '/usr/share/wordlists/rockyou.txt', '/usr/share/wordlists/seclists/Fuzzing/XSS/robot-friendly/allXSS.txt', '/usr/share/wordlists/seclists/Fuzzing/SQLi/allSQLI.txt', '/usr/share/wordlists/seclists/Fuzzing/allCOMMANDS.txt', '/usr/share/wordlists/seclists/Fuzzing/allSSTI.txt', '/usr/share/seclists/Discovery/DNS/subdomains-top1million-110000.txt', '/usr/share/seclists/Discovery/Web-Content/directory-list-2.3-big.txt', '/usr/share/wordlists/paramlist/parameters.txt', '-t 60', '-T4')
+            users_list, password_list, xss_payloads, sqli_payloads, cmd_injection_payloads, template_injection_payloads, sublist, dirlist, paralist, speed, speed_option = ('/usr/share/wordlists/seclists/Usernames/xato-net-10-million-usernames.txt', '/usr/share/wordlists/rockyou.txt', '/usr/share/wordlists/seclists/Fuzzing/XSS/robot-friendly/allXSS.txt', '/usr/share/wordlists/seclists/Fuzzing/SQLi/allSQLI.txt', '/usr/share/wordlists/seclists/Fuzzing/allCOMMANDS.txt', '/usr/share/wordlists/seclists/Fuzzing/allSSTI.txt', '/usr/share/seclists/Discovery/DNS/subdomains-top1million-110000.txt', '/usr/share/seclists/Discovery/Web-Content/directory-list-2.3-big.txt', '/usr/share/wordlists/paramlist/parameters.txt', '-t 60', '--min-rate=1000')
         else:
             raise ValueError("Invalid value for EnumLV")
 
@@ -1538,6 +1719,8 @@ async def main(output_queue):
         inject_list = f"{outputs}/recon/inject.txt"
         logging.info(f"Current working directory: Current User {outputs} : {user}")
 
+
+
         # Prepare directories asynchronously
         await prepare_directories(outputs, http_IP, IP, user, log_file)
 
@@ -1551,27 +1734,18 @@ async def main(output_queue):
 
 
         await send_pushover_notification(f"WarMachine is scanning {IP}", sound_key='scanning')
-        if http_IP:
-            await asyncio.gather(
-                fingerprint_stage(IP, tor, webproxy, ffuf2burp, speed_option, outputs, details, output_queue, log_file),
-                enumeration_stage(http_IP, IP, details, dirlist, sublist, paralist, tor, ffuf2burp, url_list, speed, outputs, output_queue, log_file, scheme)
-            )
+        time.sleep(5)
 
-            await Processes_URLS(f"{outputs}/recon/URL.log", outputs)
-            logging.info('Processesing URLs')
+        await fingerprint_stage(IP, tor, webproxy, ffuf2burp, speed_option, outputs, details, output_queue, log_file)
 
-            await asyncio.gather(
-                injection_attacks(url_list, xss_payloads, sqli_payloads, cmd_injection_payloads, template_injection_payloads, outputs),
-                CMS_scans(url_list, outputs)
-            )
-        else:
-            # Run fingerprint_stage and other stages asynchronously
-            await asyncio.gather(
-                fingerprint_stage(IP, tor, webproxy, ffuf2burp, speed_option, outputs, details, output_queue, log_file),
-                injection_attacks(url_list, xss_payloads, sqli_payloads, cmd_injection_payloads, template_injection_payloads, outputs),
-                CMS_scans(url_list, outputs)
-            )
+        logging.info("Starting IP and port extraction script...")
+        extract_and_log_ips( "WarData/fingerprint.txt", url_list)
+        logging.info("Script execution completed.")
 
+        #details = ''
+        await send_pushover_notification(f'Base scans on {IP} commpleted', sound_key='scancomplete')
+
+        await target_urls(url_list, details, dirlist, sublist, paralist, tor, ffuf2burp, speed, xss_payloads, sqli_payloads, cmd_injection_payloads, template_injection_payloads, outputs, output_queue, log_file)
 
 
 
@@ -1737,7 +1911,7 @@ signal.signal(signal.SIGTERM, handle_exit)
 
 async def main_program():
     output_queue = asyncio.Queue()
-    fingerprint_file = os.path.join(os.getcwd(), "fingerprint.txt")
+    fingerprint_file = os.path.join(os.getcwd(), "WarData/fingerprint.txt")
 
     main_task = asyncio.create_task(main(output_queue))
     curses_task = asyncio.create_task(curses.wrapper(display_output, output_queue, fingerprint_file))
